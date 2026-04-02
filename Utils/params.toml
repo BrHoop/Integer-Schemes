@@ -1,0 +1,8 @@
+Xmin = -5.0
+XMax = 5.0
+Ymin = -5.0
+Ymax = 5.0
+
+cfl = 0.25
+
+bc = "Sommerfeld"
