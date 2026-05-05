@@ -1,8 +1,29 @@
-Xmin = -5.0
-XMax = 5.0
-Ymin = -5.0
-Ymax = 5.0
+xmin = -5.0
+xmax = 5.0
+ymin = -5.0
+ymax = 5.0
+zmin = -5.0
+zmax = 5.0
 
-cfl = 0.25
+cfl = 0.05
+enable_cs = 1.0
 
 bc = "Sommerfeld"
+scheme = "floating_point"
+Nx = 512
+Ny = 512
+Nz = 128
+Nt = 3000
+Order = 8
+output_interval = 10
+sponge_strength = 0
+
+ko_sigma = 0.01
+Lambda = 2
+id_amp = 0.8
+id_sigma = 1
+id_y0 = 0.0
+id_x0 = 0.0
+id_z0 = 0.0
+K1 = 2
+K2 = 2

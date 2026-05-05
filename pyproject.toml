@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Maxwell-Chern-Simons"
+version = "0.1.1"
+dependencies = [
+    "jax",
+    "jaxlib",
+    "numpy",
+    "pathlib",
+    "h5py"
+]
