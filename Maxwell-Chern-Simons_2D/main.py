@@ -32,7 +32,10 @@ class InitialData:
 
     def generate(self):
         id_type = self.params.get("id_type", "gaussian")
-        generators = {"gaussian": self._gaussian_pulse}
+        generators = {
+            "gaussian": self._gaussian_pulse,
+            "birefringent": self._birefringent_wave
+        }
 
         if id_type not in generators:
             raise ValueError(f"Initial data type '{id_type}' not recognized.")
@@ -57,6 +60,59 @@ class InitialData:
         
         data = data.at[self.XI].set(0.0)
         data = data.at[self.PI].set(0.0)
+        data = data.at[self.PSI].set(0.0)
+        data = data.at[self.PHI].set(0.0)
+        
+        return WaveState(data)
+
+    def _birefringent_wave(self):
+        """Analytical 2.5D Left-Circularly Polarized wave for exact testing."""
+        E0 = self.params.get("id_amp", 1.0)
+        
+        # We need the CS parameters to perfectly set the Pi field
+        cs = self.params.get("enable_cs", 1.0)
+        L_param = self.params.get("Lambda", 1.0)
+        m_cs = self.params.get("id_m_cs", L_param * 2.0) 
+        
+        Lx = self.params.get("xmax", 5.0) - self.params.get("xmin", -5.0)
+        Ly = self.params.get("ymax", 5.0) - self.params.get("ymin", -5.0)
+        
+        k_x = 2.0 * jnp.pi / Lx
+        k_y = 2.0 * jnp.pi / Ly
+        k = jnp.sqrt(k_x**2 + k_y**2)
+        
+        omega_minus = jnp.sqrt(k**2 + m_cs * k)
+        
+        e1_x = -k_y / k
+        e1_y = k_x / k
+        
+        Phi = k_x * self.sim.X + k_y * self.sim.Y
+        cos_Phi = jnp.cos(Phi)
+        sin_Phi = jnp.sin(Phi)
+        
+        Ex = E0 * e1_x * cos_Phi
+        Ey = E0 * e1_y * cos_Phi
+        Ez = E0 * sin_Phi 
+        
+        Bx = (k_y * Ez) / omega_minus
+        By = (-k_x * Ez) / omega_minus
+        Bz = (k_x * Ey - k_y * Ex) / omega_minus
+        
+        # THE FIX: Calculate the required Pi field to sustain the m_cs background
+        Pi_0 = m_cs / (2.0 * cs * L_param)
+        
+        data = jnp.zeros((10, self.sim.Nx_tot, self.sim.Ny_tot), dtype=jnp.float64)
+        
+        data = data.at[self.EX].set(Ex)
+        data = data.at[self.EY].set(Ey)
+        data = data.at[self.EZ].set(Ez)
+        
+        data = data.at[self.BX].set(Bx)
+        data = data.at[self.BY].set(By)
+        data = data.at[self.BZ].set(Bz)
+        
+        data = data.at[self.XI].set(0.0)
+        data = data.at[self.PI].set(Pi_0)   # <--- Injected here
         data = data.at[self.PSI].set(0.0)
         data = data.at[self.PHI].set(0.0)
         
@@ -99,8 +155,8 @@ class MaxwellChernSimons2D:
         self.Nx, self.Ny = p["Nx"], p["Ny"]
         self.Nx_tot, self.Ny_tot = self.Nx + 2*self.ng, self.Ny + 2*self.ng
 
-        self.x = jnp.linspace(p["xmin"] - self.ng*self.dx, p["xmax"] + self.ng*self.dx, self.Nx_tot)
-        self.y = jnp.linspace(p["ymin"] - self.ng*self.dy, p["ymax"] + self.ng*self.dy, self.Ny_tot)
+        self.x = p["xmin"] + jnp.arange(-self.ng, self.Nx + self.ng) * self.dx
+        self.y = p["ymin"] + jnp.arange(-self.ng, self.Ny + self.ng) * self.dy
         
         self.X, self.Y = jnp.meshgrid(self.x, self.y, indexing='ij')
         self.R = jnp.sqrt(self.X**2 + self.Y**2) + 1e-15
@@ -145,11 +201,53 @@ class MaxwellChernSimons2D:
         dtu = dtu.at[:, -self.ng:].set(calc_bc(jnp.s_[:, -self.ng:], du_dx_c, du_dy_b))
         dtu = dtu.at[:, :self.ng].set(calc_bc(jnp.s_[:, :self.ng], du_dx_c, du_dy_f))
         return dtu
+    
+    def bc_periodic(self, field: jnp.ndarray) -> jnp.ndarray:
+        """Applies exact periodic boundary conditions to the ghost zones."""
+        # Top and Bottom boundaries
+        field = field.at[:self.ng, :].set(field[-2*self.ng:-self.ng, :])
+        field = field.at[-self.ng:, :].set(field[self.ng:2*self.ng, :])
+        
+        # Left and Right boundaries
+        field = field.at[:, :self.ng].set(field[:, -2*self.ng:-self.ng])
+        field = field.at[:, -self.ng:].set(field[:, self.ng:2*self.ng])
+        
+        return field
+    
+    def bc_directional(self, u: jnp.ndarray, dtu: jnp.ndarray) -> jnp.ndarray:
+        """Advective boundary condition that perfectly swallows a specific plane wave."""
+        v_x = self.params.get("v_x", 1.0)
+        v_y = self.params.get("v_y", 1.0)
+
+        # 1st-order upwind stencils (identical to your Sommerfeld setup)
+        du_dx_f = (jnp.roll(u, -1, axis=0) - u) / self.dx
+        du_dx_b = (u - jnp.roll(u, 1, axis=0)) / self.dx
+        du_dy_f = (jnp.roll(u, -1, axis=1) - u) / self.dy
+        du_dy_b = (u - jnp.roll(u, 1, axis=1)) / self.dy
+        du_dx_c, du_dy_c = self.d_dx(u), self.d_dy(u)
+
+        # The new directional advection math
+        def calc_bc(slc, dx_op, dy_op):
+            return -v_x * dx_op[slc] - v_y * dy_op[slc]
+
+        # Apply to the ghost zones
+        dtu = dtu.at[:self.ng, :].set(calc_bc(jnp.s_[:self.ng, :], du_dx_f, du_dy_c))
+        dtu = dtu.at[-self.ng:, :].set(calc_bc(jnp.s_[-self.ng:, :], du_dx_b, du_dy_c))
+        dtu = dtu.at[:, -self.ng:].set(calc_bc(jnp.s_[:, -self.ng:], du_dx_c, du_dy_b))
+        dtu = dtu.at[:, :self.ng].set(calc_bc(jnp.s_[:, :self.ng], du_dx_c, du_dy_f))
+        
+        return dtu
 
     def rhs(self, state: WaveState) -> WaveState:
         cs = self.params.get("enable_cs", 1.0)
         L = self.Lambda
-        s = state
+        bc_type = self.params.get("bc_type", "sommerfeld")
+
+        synced_data = state.data
+        if bc_type == "periodic":
+            synced_data = jax.vmap(self.bc_periodic)(synced_data)
+        
+        s = WaveState(synced_data)
 
         dt_Ex = self.d_dy(s.Bz) - self.d_dx(s.Psi) - cs*2*L*(s.Pi*s.Bx - s.Ez*self.d_dy(s.xi))
         dt_Ey = -self.d_dx(s.Bz) - self.d_dy(s.Psi) - cs*2*L*(s.Pi*s.By + s.Ez*self.d_dx(s.xi))
@@ -166,14 +264,23 @@ class MaxwellChernSimons2D:
 
         dt_data = jnp.stack([dt_Ex, dt_Ey, dt_Ez, dt_Bx, dt_By, dt_Bz, dt_xi, dt_Pi, dt_Psi, dt_Phi])
 
-        for i in [self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ, self.PSI, self.PHI]:
-            dt_data = dt_data.at[i].set(self.bc_sommerfeld(state.data[i], dt_data[i]))
-        
-        for i in [self.XI, self.PI]:
-            dt_data = dt_data.at[i].set(self.bc_zero(dt_data[i]))
+        for i in [self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ, self.PSI, self.PHI, self.XI, self.PI]:
+            if bc_type == "periodic":
+                dt_data = dt_data.at[i].set(self.bc_periodic(dt_data[i]))
+            elif bc_type == "directional":
+                if i in [self.XI, self.PI]:
+                    dt_data = dt_data.at[i].set(self.bc_zero(dt_data[i]))
+                else:
+                    # Swallow the wave in a straight line!
+                    dt_data = dt_data.at[i].set(self.bc_directional(s.data[i], dt_data[i]))
+            else:
+                if i in [self.XI, self.PI]:
+                    dt_data = dt_data.at[i].set(self.bc_zero(dt_data[i]))
+                else:
+                    dt_data = dt_data.at[i].set(self.bc_sommerfeld(s.data[i], dt_data[i]))
 
         if self.ko_sigma > 0:
-            dt_data += jax.vmap(self.apply_ko)(state.data)
+            dt_data += jax.vmap(self.apply_ko)(s.data)
             
         dt_data -= (self.sponge_strength * self.sponge_mask) * state.data
         return WaveState(dt_data)

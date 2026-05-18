@@ -32,9 +32,15 @@ class InitialData:
 
     def generate(self):
         id_type = self.params.get("id_type", "gaussian")
-        if id_type == "gaussian":
-            return self._gaussian_pulse()
-        raise ValueError(f"Initial data type '{id_type}' not recognized.")
+        generators = {
+            "gaussian": self._gaussian_pulse,
+            "birefringent": self._birefringent_wave_3d
+        }
+
+        if id_type not in generators:
+            raise ValueError(f"Initial data type '{id_type}' not recognized.")
+        
+        return generators[id_type]()
 
     def _gaussian_pulse(self):
         x0, y0, z0 = self.params.get("id_x0", 0.0), self.params.get("id_y0", 0.0), self.params.get("id_z0", 0.0)
@@ -67,6 +73,68 @@ class InitialData:
         
         return WaveState(data)
 
+    def _birefringent_wave_3d(self):
+        """Analytical 3D Left-Circularly Polarized wave (Flawless Polarization Triad)."""
+        E0 = self.params.get("id_amp", 1.0)
+        cs = self.params.get("enable_cs", 1.0)
+        L_param = self.params.get("Lambda", 1.0)
+        m_cs = self.params.get("id_m_cs", L_param * 2.0) 
+        
+        Lx = self.params.get("xmax", 5.0) - self.params.get("xmin", -5.0)
+        Ly = self.params.get("ymax", 5.0) - self.params.get("ymin", -5.0)
+        Lz = self.params.get("zmax", 5.0) - self.params.get("zmin", -5.0)
+        
+        k_x = 2.0 * jnp.pi / Lx
+        k_y = 2.0 * jnp.pi / Ly
+        k_z = 2.0 * jnp.pi / Lz
+        k = jnp.sqrt(k_x**2 + k_y**2 + k_z**2)
+        
+        # Unconditionally stable dispersion relation
+        omega = jnp.sqrt(k**2 + m_cs * k)
+        
+        # Generate Orthogonal Polarization Basis (e1, e2 perpendicular to k)
+        norm_factor = jnp.sqrt(k_x**2 + k_y**2)
+        e1_x = k_y / norm_factor
+        e1_y = -k_x / norm_factor
+        e1_z = 0.0
+        
+        e2_x = -k_x * k_z / (k * norm_factor)
+        e2_y = -k_y * k_z / (k * norm_factor)
+        e2_z = norm_factor / k
+        
+        Phi = k_x * self.sim.X + k_y * self.sim.Y + k_z * self.sim.Z
+        cos_Phi = jnp.cos(Phi)
+        sin_Phi = jnp.sin(Phi)
+        
+        # FIXED: E = E0 * (e1 * cos_Phi - e2 * sin_Phi)
+        Ex = E0 * (e1_x * cos_Phi - e2_x * sin_Phi)
+        Ey = E0 * (e1_y * cos_Phi - e2_y * sin_Phi)
+        Ez = E0 * (e1_z * cos_Phi - e2_z * sin_Phi)
+        
+        # FIXED: B = (k/w) * E0 * (-e1 * sin_Phi - e2 * cos_Phi)
+        b_scale = k / omega
+        Bx = E0 * b_scale * (-e1_x * sin_Phi - e2_x * cos_Phi)
+        By = E0 * b_scale * (-e1_y * sin_Phi - e2_y * cos_Phi)
+        Bz = E0 * b_scale * (-e1_z * sin_Phi - e2_z * cos_Phi)
+        
+        Pi_0 = m_cs / (2.0 * cs * L_param)
+        
+        data = jnp.zeros((10, self.sim.Nx_tot, self.sim.Ny_tot, self.sim.Nz_tot), dtype=jnp.float64)
+        
+        data = data.at[self.EX].set(Ex)
+        data = data.at[self.EY].set(Ey)
+        data = data.at[self.EZ].set(Ez)
+        data = data.at[self.BX].set(Bx)
+        data = data.at[self.BY].set(By)
+        data = data.at[self.BZ].set(Bz)
+        
+        data = data.at[self.XI].set(0.0)
+        data = data.at[self.PI].set(Pi_0)
+        data = data.at[self.PSI].set(0.0)
+        data = data.at[self.PHI].set(0.0)
+        
+        return WaveState(data)
+
 class MaxwellChernSimons3D:
     """Solves the 3D Maxwell-Chern-Simons equations."""
 
@@ -89,8 +157,8 @@ class MaxwellChernSimons3D:
         self._init_grid(params)
         self._init_sponge(params)
 
-        self.K1 = params.get("K1", 100.0)
-        self.K2 = params.get("K2", 100.0)
+        self.K1 = params.get("K1", 1.0)
+        self.K2 = params.get("K2", 1.0)
         self.ko_sigma = params.get("ko_sigma", 0.05)
 
     def _init_derivative_operator(self):
@@ -101,13 +169,17 @@ class MaxwellChernSimons3D:
         self.Nx, self.Ny, self.Nz = p["Nx"], p["Ny"], p["Nz"]
         self.Nx_tot, self.Ny_tot, self.Nz_tot = self.Nx + 2*self.ng, self.Ny + 2*self.ng, self.Nz + 2*self.ng
 
-        self.x = jnp.linspace(p["xmin"] - self.ng*self.dx, p["xmax"] + self.ng*self.dx, self.Nx_tot)
-        self.y = jnp.linspace(p["ymin"] - self.ng*self.dy, p["ymax"] + self.ng*self.dy, self.Ny_tot)
-        self.z = jnp.linspace(p["zmin"] - self.ng*self.dz, p["zmax"] + self.ng*self.dz, self.Nz_tot)
+        # Using arange to prevent the duplicate endpoint trap
+        self.x = p["xmin"] + jnp.arange(-self.ng, self.Nx + self.ng) * self.dx
+        self.y = p["ymin"] + jnp.arange(-self.ng, self.Ny + self.ng) * self.dy
+        self.z = p["zmin"] + jnp.arange(-self.ng, self.Nz + self.ng) * self.dz
         
         self.R = jnp.sqrt(self.x[:, None, None]**2 + 
                           self.y[None, :, None]**2 + 
                           self.z[None, None, :]**2) + 1e-15
+                          
+        # Only needed if you do full 3D spatial evaluations like the analytical wave:
+        self.X, self.Y, self.Z = jnp.meshgrid(self.x, self.y, self.z, indexing='ij')
 
     def _init_sponge(self, p: Dict[str, Any]):
         width = 0.1 * (p["xmax"] - p["xmin"])
@@ -146,6 +218,21 @@ class MaxwellChernSimons3D:
         field = field.at[:, :, -self.ng:].set(0.0)
         return field
 
+    def bc_periodic(self, field: jnp.ndarray) -> jnp.ndarray:
+        """Applies exact periodic boundary conditions to the 3D ghost zones."""
+        # X boundaries
+        field = field.at[:self.ng, :, :].set(field[-2*self.ng:-self.ng, :, :])
+        field = field.at[-self.ng:, :, :].set(field[self.ng:2*self.ng, :, :])
+        
+        # Y boundaries
+        field = field.at[:, :self.ng, :].set(field[:, -2*self.ng:-self.ng, :])
+        field = field.at[:, -self.ng:, :].set(field[:, self.ng:2*self.ng, :])
+        
+        # Z boundaries
+        field = field.at[:, :, :self.ng].set(field[:, :, -2*self.ng:-self.ng])
+        field = field.at[:, :, -self.ng:].set(field[:, :, self.ng:2*self.ng])
+        return field
+
     def bc_sommerfeld(self, u: jnp.ndarray, dtu: jnp.ndarray) -> jnp.ndarray:
         du_dx_f = (jnp.roll(u, -1, axis=0) - u) / self.dx
         du_dx_b = (u - jnp.roll(u, 1, axis=0)) / self.dx
@@ -174,8 +261,16 @@ class MaxwellChernSimons3D:
     def rhs(self, state: WaveState) -> WaveState:
         cs = self.params.get("enable_cs", 1.0)
         L = self.Lambda
-        s = state
+        bc_type = self.params.get("bc_type", "sommerfeld")
 
+        # 1. State Synchronization
+        synced_data = state.data
+        if bc_type == "periodic":
+            synced_data = jax.vmap(self.bc_periodic)(synced_data)
+        
+        s = WaveState(synced_data)
+
+        # 2. Compute Derivatives using synchronized state 's'
         dt_Ex = (self.d_dy(s.Bz) - self.d_dz(s.By)) - self.d_dx(s.Psi) - cs*2*L*(s.Pi*s.Bx - s.Ez*self.d_dy(s.xi) + s.Ey*self.d_dz(s.xi))
         dt_Ey = (self.d_dz(s.Bx) - self.d_dx(s.Bz)) - self.d_dy(s.Psi) - cs*2*L*(s.Pi*s.By - s.Ex*self.d_dz(s.xi) + s.Ez*self.d_dx(s.xi))
         dt_Ez = (self.d_dx(s.By) - self.d_dy(s.Bx)) - self.d_dz(s.Psi) - cs*2*L*(s.Pi*s.Bz - s.Ey*self.d_dx(s.xi) + s.Ex*self.d_dy(s.xi))
@@ -192,16 +287,21 @@ class MaxwellChernSimons3D:
 
         dt_data = jnp.stack([dt_Ex, dt_Ey, dt_Ez, dt_Bx, dt_By, dt_Bz, dt_xi, dt_Pi, dt_Psi, dt_Phi])
 
-        for i in [self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ, self.PSI, self.PHI]:
-            dt_data = dt_data.at[i].set(self.bc_sommerfeld(state.data[i], dt_data[i]))
-        
-        for i in [self.XI, self.PI]:
-            dt_data = dt_data.at[i].set(self.bc_zero(dt_data[i]))
-
+        # 3. Add Dissipation & Sponge BEFORE boundaries
         if self.ko_sigma > 0:
-            dt_data += jax.vmap(self.apply_ko)(state.data)
+            dt_data += jax.vmap(self.apply_ko)(s.data)
             
-        dt_data -= (self.sponge_strength * self.sponge_mask) * state.data
+        dt_data -= (self.sponge_strength * self.sponge_mask) * s.data
+
+        # 4. Final Boundary Enforcement
+        for i in [self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ, self.PSI, self.PHI, self.XI, self.PI]:
+            if bc_type == "periodic":
+                dt_data = dt_data.at[i].set(self.bc_periodic(dt_data[i]))
+            else:
+                if i in [self.XI, self.PI]:
+                    dt_data = dt_data.at[i].set(self.bc_zero(dt_data[i]))
+                else:
+                    dt_data = dt_data.at[i].set(self.bc_sommerfeld(s.data[i], dt_data[i]))
 
         return WaveState(dt_data)
 
@@ -259,7 +359,7 @@ def load_parameters(parfile: str) -> Dict[str, Any]:
             
     print(f">> WARNING: Parameter file '{parfile}' not found. Using defaults.")
     return {
-        "Nx": 128, "Ny": 128, "Nz": 128, "Nt": 1000, "output_interval": 10,
+        "Nx": 64, "Ny": 64, "Nz": 64, "Nt": 1000, "output_interval": 10,
         "cfl": 0.05, "ko_sigma": 0.05, "Lambda": 0.1, 
         "enable_cs": 1.0, "sponge_strength": 10.0,
         "scheme": "floating_point", 
@@ -274,9 +374,10 @@ def main(parfile: str, output_dir: str):
     nx, ny, nz = params["Nx"], params["Ny"], params["Nz"]
     nt, out_int = params["Nt"], params["output_interval"]
     
-    dx = (params["xmax"] - params["xmin"]) / (nx - 1)
-    dy = (params["ymax"] - params["ymin"]) / (ny - 1)
-    dz = (params["zmax"] - params["zmin"]) / (nz - 1)
+    # Grid calculation explicitly updated to remove the duplicated endpoints!
+    dx = (params["xmax"] - params["xmin"]) / nx
+    dy = (params["ymax"] - params["ymin"]) / ny
+    dz = (params["zmax"] - params["zmin"]) / nz
 
     sim = MaxwellChernSimons3D(dx, dy, dz, params.get("Lambda", 0.1), params)
     state = InitialData(sim, params).generate()
