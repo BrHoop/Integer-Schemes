@@ -1,0 +1,72 @@
+{
+  "device": "NVIDIA H200",
+  "backend": "gpu",
+  "vram_gb": 140.4,
+  "peak_bw_GBs": 4800,
+  "peak_fp64_GFLOPs": 34000,
+  "peak_int8_TOPs": 1979000,
+  "grids": [
+    256,
+    512
+  ],
+  "schemes": [
+    "fused_floating_point"
+  ],
+  "n_scan_steps": 100,
+  "pallas_pad_pow2": true,
+  "pallas_H_orig": 22,
+  "pallas_H_pad": 32,
+  "pallas_NF": 10,
+  "pallas_NF_pad": 16,
+  "pallas_pad_waste": 3.385,
+  "rows": [
+    {
+      "scheme": "fused_floating_point",
+      "nx": 256,
+      "compile_s": 0.40420044600614347,
+      "per_step_us": 290.0016002240591,
+      "rhs_per_step_us": 49.529570096638054,
+      "throughput_Mpts_s": 225.9849599083799,
+      "end_to_end_s_N2000": 0.9842036464542616,
+      "state_MB": 5.49,
+      "peak_device_MB": 49.6,
+      "l2_err": 9.659895667507385e-13,
+      "rhs_GFLOP": 0.0864,
+      "rhs_MB_accessed": 27.12,
+      "rhs_flop_per_byte": 3.187,
+      "bound": "memory",
+      "step_GFLOP": 0.4384,
+      "step_MB_accessed": 602.54,
+      "step_flop_per_byte": 0.728,
+      "achieved_GFLOPs": 1511.7,
+      "achieved_GBs": 2077.7,
+      "speedup_step_vs_fp": 1.0,
+      "speedup_rhs_vs_fp": 1.0,
+      "bw_eff_pct": 43.3
+    },
+    {
+      "scheme": "fused_floating_point",
+      "nx": 512,
+      "compile_s": 0.47750411997549236,
+      "per_step_us": 1159.9465101608075,
+      "rhs_per_step_us": 180.2989700809121,
+      "throughput_Mpts_s": 225.99662803732048,
+      "end_to_end_s_N2000": 2.7973971402971074,
+      "state_MB": 21.47,
+      "peak_device_MB": 219.0,
+      "l2_err": 1.516912995655759e-14,
+      "rhs_GFLOP": 0.3084,
+      "rhs_MB_accessed": 95.81,
+      "rhs_flop_per_byte": 3.218,
+      "bound": "memory",
+      "step_GFLOP": 1.7204,
+      "step_MB_accessed": 2573.91,
+      "step_flop_per_byte": 0.668,
+      "achieved_GFLOPs": 1483.2,
+      "achieved_GBs": 2219.0,
+      "speedup_step_vs_fp": 1.0,
+      "speedup_rhs_vs_fp": 1.0,
+      "bw_eff_pct": 46.2
+    }
+  ]
+}

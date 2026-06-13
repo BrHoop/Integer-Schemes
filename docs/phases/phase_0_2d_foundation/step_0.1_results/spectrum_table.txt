@@ -1,0 +1,10 @@
+CFJ onset m_cs = 0.800
+  k=0.5*m_cs: {'oscillatory': 4, 'damped': 5, 'growing': 1}
+  k=3.0*m_cs: {'oscillatory': 6, 'damped': 4, 'growing': 0}
+Constraint-damping eigenvalue vs K (Re of most-damped mode; expect -K/2):
+  K=0.0: min Re(lambda) = -0.0000  (-K/2 = -0.0000)
+  K=0.5: min Re(lambda) = -0.2500  (-K/2 = -0.2500)
+  K=1.0: min Re(lambda) = -0.5000  (-K/2 = -0.5000)
+  K=2.0: min Re(lambda) = -1.0000  (-K/2 = -1.0000)
+  K=5.0: min Re(lambda) = -2.5000  (-K/2 = -2.5000)
+Strong-hyperbolicity condition number (worst dir): 3.885

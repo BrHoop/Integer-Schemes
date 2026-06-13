@@ -1,0 +1,64 @@
+# ── Domain ────────────────────────────────────────────────────────────────────
+xmin = -5.0        # left  boundary of the x-domain
+xmax =  5.0        # right boundary of the x-domain
+ymin = -5.0        # left  boundary of the y-domain
+ymax =  5.0        # right boundary of the y-domain
+
+# ── Grid resolution ───────────────────────────────────────────────────────────
+Nx = 512           # interior grid points in x
+Ny = 512           # interior grid points in y
+Nt = 2000          # total number of time steps
+output_interval = 25  # save output every N steps (1 = every step; increase to save disk space)
+
+# ── Time integration ──────────────────────────────────────────────────────────
+cfl = 0.05         # CFL coefficient: dt = cfl * dx  (2D stable limit ~0.05; use 0.02 for 3D)
+Order = 6          # finite-difference stencil order (only 6th-order is currently implemented)
+
+# ── Numerical scheme ──────────────────────────────────────────────────────────
+# "floating_point"       – pure FP64 finite differences; reference implementation
+# "ozaki"                – unfused INT8 Ozaki RNS
+# "fused_floating_point" – tiled FP64; single HBM pass per tile (same result as fp)
+# "fused_ozaki"          – tiled INT8 Ozaki RNS (XLA fusion; CRT spills to L2)
+# "pallas_ozaki"         – single Pallas kernel per tile, CRT in shared memory
+#                          (no L2 round-trips between Garner levels — see notes)
+scheme = "ozaki"
+
+# Optional: override the Ozaki extension moduli list (advanced).  Fewer moduli
+# = faster CRT but smaller dynamic range.  See CrtFloatConverter docstring for
+# the safety bound.  Default = [239, 233] (8 total moduli — safe for all
+# stencils with ~5.7 bits of headroom, and more accurate than 9 moduli).
+#   ozaki_mods_ext = [239, 233, 229]   # original conservative default (9 total)
+#   ozaki_mods_ext = [239]              # UNSAFE for C2 (D2); OK for C1/CKO only
+
+# ── Boundary conditions ───────────────────────────────────────────────────────
+# "periodic"     – wrap-around; required for birefringent initial data
+# "sommerfeld"   – 1st-order outgoing radiation (ABC)
+bc_type = "periodic"
+
+# ── Dissipation ───────────────────────────────────────────────────────────────
+ko_sigma = 0.05    # Kreiss-Oliger dissipation coefficient (set to 0 to disable)
+sponge_strength = 0  # sponge-layer damping at domain edges (0 to disable)
+
+# ── Physics ───────────────────────────────────────────────────────────────────
+enable_cs = 1.0    # Chern-Simons coupling switch (1.0 = MCS; 0.0 = pure Maxwell + scalar wave)
+# Chern-Simons coupling constant Λ (mass parameter m_cs = 2*Lambda).
+# STABILITY: the MCS dispersion has a Carroll-Field-Jackiw tachyonic branch
+# ω² = k² − m_cs·k, which is unstable (exponentially growing) when k < m_cs.
+# The birefringent IC's mode is k = √2·2π/Lx ≈ 0.89 here, so it stays stable
+# only while m_cs = 2*Lambda < k, i.e. Lambda < ~0.44.  Keep Lambda ≤ 0.4 for
+# the analytic birefringent solution; larger values intentionally excite the
+# physical CFJ instability.
+Lambda = 0.4       # in the CFJ-stable regime (m_cs = 0.8 < k ≈ 0.89)
+
+# ── Constraint damping ────────────────────────────────────────────────────────
+K1 = 1             # damping rate for the div-E constraint (Psi evolution equation)
+K2 = 1             # damping rate for the div-B constraint (Phi evolution equation)
+
+# ── Initial data ──────────────────────────────────────────────────────────────
+# "birefringent" – left-circularly polarised birefringent plane wave (has exact analytical solution)
+# "gaussian"     – Gaussian pulse centred at (id_x0, id_y0)
+id_type  = "birefringent"
+id_amp   = 0.8     # amplitude of the initial wave / pulse
+id_sigma = 1.0     # Gaussian pulse width σ  (Gaussian IC only)
+id_x0    = 0.0     # pulse centre x  (Gaussian IC only)
+id_y0    = 0.0     # pulse centre y  (Gaussian IC only)

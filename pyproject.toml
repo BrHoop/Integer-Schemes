@@ -1,14 +1,18 @@
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+# Workspace root.  This repo is a monorepo containing three installable
+# Python packages — install them with:
+#
+#     pip install -e ./common ./2D ./3D
+#
+# Each package has its own pyproject.toml and tests.  This file pins the dev
+# tooling shared across them.
 
-[project]
-name = "Maxwell-Chern-Simons"
-version = "0.1.1"
-dependencies = [
-    "jax",
-    "jaxlib",
-    "numpy",
-    "pathlib",
-    "h5py"
+[tool.pytest.ini_options]
+# Default test discovery: run both 2D and 3D suites.  Override with
+# `pytest 2D/tests/...` or `./2D/tests/run.sh`.
+testpaths = ["2D/tests", "3D/tests"]
+markers = [
+    "slow: tests that take longer than ~5 s",
+    "gpu: requires a real GPU (skipped on CPU-only CI)",
+    "amr: AMR-specific tests",
+    "regression: regression / invariant guards (no recompile, bit-identical)",
 ]

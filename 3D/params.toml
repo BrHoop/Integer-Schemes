@@ -1,0 +1,56 @@
+# ── Domain ────────────────────────────────────────────────────────────────────
+xmin = -5.0        # left  boundary of the x-domain
+xmax =  5.0        # right boundary of the x-domain
+ymin = -5.0        # left  boundary of the y-domain
+ymax =  5.0        # right boundary of the y-domain
+zmin = -5.0        # left  boundary of the z-domain
+zmax =  5.0        # right boundary of the z-domain
+
+# ── Grid resolution ───────────────────────────────────────────────────────────
+Nx = 512           # interior grid points in x
+Ny = 512           # interior grid points in y
+Nz = 64            # interior grid points in z
+Nt = 2000          # total number of time steps
+output_interval = 25  # save output every N steps (1 = every step; increase to save disk space)
+
+# ── Time integration ──────────────────────────────────────────────────────────
+cfl = 0.02         # CFL coefficient: dt = cfl * dx  (3D stable limit ~0.02; use 0.05 for 2D)
+Order = 6          # finite-difference stencil order (only 6th-order is currently implemented)
+
+# ── Numerical scheme ──────────────────────────────────────────────────────────
+# "floating_point" – pure FP64 finite differences; always correct; use as reference
+# "ozaki"          – INT8 Ozaki RNS scheme; exploits GPU INT8 tensor cores for speed
+scheme = "floating_point"
+
+# ── Boundary conditions ───────────────────────────────────────────────────────
+# "periodic"     – wrap-around; required for birefringent initial data
+# "sommerfeld"   – 1st-order outgoing radiation (ABC)
+bc_type = "periodic"
+
+# ── Dissipation ───────────────────────────────────────────────────────────────
+ko_sigma = 0.05    # Kreiss-Oliger dissipation coefficient (set to 0 to disable)
+sponge_strength = 0  # sponge-layer damping at domain edges (0 to disable)
+
+# ── Physics ───────────────────────────────────────────────────────────────────
+enable_cs = 1.0    # Chern-Simons coupling switch (1.0 = MCS; 0.0 = pure Maxwell + scalar wave)
+# Chern-Simons coupling constant Λ (mass parameter m_cs = 2*Lambda).
+# STABILITY: the MCS dispersion has a Carroll-Field-Jackiw tachyonic branch
+# ω² = k² − m_cs·k, unstable (exponentially growing) when k < m_cs.  The
+# birefringent IC mode is k = √3·2π/Lx ≈ 1.09 here, so it stays stable only
+# while m_cs = 2*Lambda < k, i.e. Lambda < ~0.54.  Keep Lambda ≤ 0.4 for the
+# analytic birefringent solution; larger values excite the physical CFJ mode.
+Lambda = 0.4       # in the CFJ-stable regime (m_cs = 0.8 < k ≈ 1.09)
+
+# ── Constraint damping ────────────────────────────────────────────────────────
+K1 = 1             # damping rate for the div-E constraint (Psi evolution equation)
+K2 = 1             # damping rate for the div-B constraint (Phi evolution equation)
+
+# ── Initial data ──────────────────────────────────────────────────────────────
+# "birefringent" – left-circularly polarised birefringent plane wave (has exact analytical solution)
+# "gaussian"     – Gaussian pulse centred at (id_x0, id_y0, id_z0)
+id_type  = "birefringent"
+id_amp   = 0.8     # amplitude of the initial wave / pulse
+id_sigma = 1.0     # Gaussian pulse width σ  (Gaussian IC only)
+id_x0    = 0.0     # pulse centre x  (Gaussian IC only)
+id_y0    = 0.0     # pulse centre y  (Gaussian IC only)
+id_z0    = 0.0     # pulse centre z  (Gaussian IC only)

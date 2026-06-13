@@ -210,3 +210,14 @@ __marimo__/
 *.h5
 *.xdmf
 *.gif
+
+# ── Integer-Schemes project artefacts ─────────────────────────────────────────
+# GPU profiler traces (large; pull with ./sync.sh pull traces)
+traces/
+# Generated simulation / profiling output dirs (pull with ./sync.sh pull)
+output/
+# Generic validation-harness output (default now lives under docs/.../step_1.1_results)
+validation_plots/
+# NOTE: docs/phases/phase_1_stencil_core/step_1.1_results/ is intentionally TRACKED
+# (the Step 1.1 deliverables live with the spec). Do not ignore it.# XLA dump from bssn3d.spill_probe (regenerated; large IR/MLIR files)
+bssn_xla_dump/

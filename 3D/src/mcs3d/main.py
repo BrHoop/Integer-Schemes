@@ -19,8 +19,8 @@ if root_dir not in sys.path:
 import jax.numpy as jnp
 import numpy as np
 
-import Utils.ioxdmf as iox
-from Utils.wave_state import WaveState
+import mcs_common.ioxdmf as iox
+from mcs_common.wave_state import WaveState
 
 class InitialData:
     """Generates divergence-free initial conditions for the 3D wave simulation."""
@@ -155,14 +155,13 @@ class MaxwellChernSimons3D:
         self.ng = self.diff_op.ng 
 
         self._init_grid(params)
-        self._init_sponge(params)
 
         self.K1 = params.get("K1", 1.0)
         self.K2 = params.get("K2", 1.0)
         self.ko_sigma = params.get("ko_sigma", 0.05)
 
     def _init_derivative_operator(self):
-        from floating_point import SpatialDerivative as FloatDerivative
+        from mcs3d.schemes.floating_point import SpatialDerivative as FloatDerivative
         self.diff_op = FloatDerivative(order=self.order)
 
     def _init_grid(self, p: Dict[str, Any]):
@@ -181,20 +180,6 @@ class MaxwellChernSimons3D:
         # Only needed if you do full 3D spatial evaluations like the analytical wave:
         self.X, self.Y, self.Z = jnp.meshgrid(self.x, self.y, self.z, indexing='ij')
 
-    def _init_sponge(self, p: Dict[str, Any]):
-        width = 0.1 * (p["xmax"] - p["xmin"])
-        
-        dist_x = jnp.maximum(0.0, jnp.abs(self.x) - (p["xmax"] - width))
-        dist_y = jnp.maximum(0.0, jnp.abs(self.y) - (p["ymax"] - width))
-        dist_z = jnp.maximum(0.0, jnp.abs(self.z) - (p["zmax"] - width))
-        
-        mask = (dist_x[:, None, None] / width)**2 + \
-               (dist_y[None, :, None] / width)**2 + \
-               (dist_z[None, None, :] / width)**2
-               
-        self.sponge_mask = jnp.clip(mask, 0.0, 1.0)
-        self.sponge_strength = p.get("sponge_strength", 10.0)
-
     def d_dx(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d1(u, self.dx, axis=0)
     def d_dy(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d1(u, self.dy, axis=1)
     def d_dz(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d1(u, self.dz, axis=2)
@@ -202,6 +187,15 @@ class MaxwellChernSimons3D:
     def d2_dx2(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d2(u, self.dx, axis=0)
     def d2_dy2(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d2(u, self.dy, axis=1)
     def d2_dz2(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d2(u, self.dz, axis=2)
+
+    def _d1_batched(self, u_batch: jnp.ndarray, dx: float, axis: int) -> jnp.ndarray:
+        return jax.vmap(lambda u: self.diff_op.compute_d1(u, dx, axis))(u_batch)
+
+    def _d2_batched(self, u_batch: jnp.ndarray, dx: float, axis: int) -> jnp.ndarray:
+        return jax.vmap(lambda u: self.diff_op.compute_d2(u, dx, axis))(u_batch)
+
+    def _ko_batched(self, u_batch: jnp.ndarray, dx: float, sigma: float, axis: int) -> jnp.ndarray:
+        return jax.vmap(lambda u: self.diff_op.compute_ko(u, dx, sigma, axis))(u_batch)
 
     def apply_ko(self, u: jnp.ndarray) -> jnp.ndarray:
         ko = (self.diff_op.compute_ko(u, self.dx, self.ko_sigma, axis=0) + 
@@ -244,10 +238,7 @@ class MaxwellChernSimons3D:
         du_dx_c, du_dy_c, du_dz_c = self.d_dx(u), self.d_dy(u), self.d_dz(u)
 
         def calc_bc(slc, dx_op, dy_op, dz_op):
-            X_slc = self.x[:, None, None][slc]
-            Y_slc = self.y[None, :, None][slc]
-            Z_slc = self.z[None, None, :][slc]
-            return (-X_slc * dx_op[slc] - Y_slc * dy_op[slc] - Z_slc * dz_op[slc]) / self.R[slc]
+            return (-self.X[slc] * dx_op[slc] - self.Y[slc] * dy_op[slc] - self.Z[slc] * dz_op[slc]) / self.R[slc]
 
         dtu = dtu.at[:self.ng, :, :].set(calc_bc(jnp.s_[:self.ng, :, :], du_dx_f, du_dy_c, du_dz_c))
         dtu = dtu.at[-self.ng:, :, :].set(calc_bc(jnp.s_[-self.ng:, :, :], du_dx_b, du_dy_c, du_dz_c))
@@ -263,41 +254,54 @@ class MaxwellChernSimons3D:
         L = self.Lambda
         bc_type = self.params.get("bc_type", "sommerfeld")
 
-        # 1. State Synchronization
         synced_data = state.data
         if bc_type == "periodic":
             synced_data = jax.vmap(self.bc_periodic)(synced_data)
-        
+
         s = WaveState(synced_data)
 
-        # 2. Compute Derivatives using synchronized state 's'
-        dt_Ex = (self.d_dy(s.Bz) - self.d_dz(s.By)) - self.d_dx(s.Psi) - cs*2*L*(s.Pi*s.Bx - s.Ez*self.d_dy(s.xi) + s.Ey*self.d_dz(s.xi))
-        dt_Ey = (self.d_dz(s.Bx) - self.d_dx(s.Bz)) - self.d_dy(s.Psi) - cs*2*L*(s.Pi*s.By - s.Ex*self.d_dz(s.xi) + s.Ez*self.d_dx(s.xi))
-        dt_Ez = (self.d_dx(s.By) - self.d_dy(s.Bx)) - self.d_dz(s.Psi) - cs*2*L*(s.Pi*s.Bz - s.Ey*self.d_dx(s.xi) + s.Ex*self.d_dy(s.xi))
-        
-        dt_Bx = -self.d_dy(s.Ez) + self.d_dz(s.Ey) + self.d_dx(s.Phi)
-        dt_By = -self.d_dz(s.Ex) + self.d_dx(s.Ez) + self.d_dy(s.Phi)
-        dt_Bz = -self.d_dx(s.Ey) + self.d_dy(s.Ex) + self.d_dz(s.Phi)
-        
-        dt_xi = -s.Pi * cs
-        dt_Pi = (-self.d2_dx2(s.xi) - self.d2_dy2(s.xi) - self.d2_dz2(s.xi) + 2*L*(s.Bx*s.Ex + s.By*s.Ey + s.Bz*s.Ez)) * cs
-        
-        dt_Psi = -self.d_dx(s.Ex) - self.d_dy(s.Ey) - self.d_dz(s.Ez) - self.K1*s.Psi - cs*2*L*(s.Bx*self.d_dx(s.xi) + s.By*self.d_dy(s.xi) + s.Bz*self.d_dz(s.xi))
-        dt_Phi = self.d_dx(s.Bx) + self.d_dy(s.By) + self.d_dz(s.Bz) - self.K2 * s.Phi
+        # Batch all 9 differentiated fields (PI only appears as a multiplier).
+        # Three vmap calls replace ~27 individual compute_d1 calls.
+        _d1_idx = jnp.array([self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ,
+                              self.XI, self.PSI, self.PHI])
+        d1_in = s.data[_d1_idx]
+        dx_all = self._d1_batched(d1_in, self.dx, axis=0)
+        dy_all = self._d1_batched(d1_in, self.dy, axis=1)
+        dz_all = self._d1_batched(d1_in, self.dz, axis=2)
 
-        dt_data = jnp.stack([dt_Ex, dt_Ey, dt_Ez, dt_Bx, dt_By, dt_Bz, dt_xi, dt_Pi, dt_Psi, dt_Phi])
+        dEx_dx, dEy_dx, dEz_dx, dBx_dx, dBy_dx, dBz_dx, dxi_dx, dPsi_dx, dPhi_dx = dx_all
+        dEx_dy, dEy_dy, dEz_dy, dBx_dy, dBy_dy, dBz_dy, dxi_dy, dPsi_dy, dPhi_dy = dy_all
+        dEx_dz, dEy_dz, dEz_dz, dBx_dz, dBy_dz, dBz_dz, dxi_dz, dPsi_dz, dPhi_dz = dz_all
 
-        # 3. Add Dissipation & Sponge BEFORE boundaries
+        d2xi_dx2 = self.diff_op.compute_d2(s.xi, self.dx, axis=0)
+        d2xi_dy2 = self.diff_op.compute_d2(s.xi, self.dy, axis=1)
+        d2xi_dz2 = self.diff_op.compute_d2(s.xi, self.dz, axis=2)
+
+        dt_Ex  = (dBz_dy  - dBy_dz) - dPsi_dx - cs*2*L*(s.Pi*s.Bx - s.Ez*dxi_dy  + s.Ey*dxi_dz)
+        dt_Ey  = (dBx_dz  - dBz_dx) - dPsi_dy - cs*2*L*(s.Pi*s.By - s.Ex*dxi_dz  + s.Ez*dxi_dx)
+        dt_Ez  = (dBy_dx  - dBx_dy) - dPsi_dz - cs*2*L*(s.Pi*s.Bz - s.Ey*dxi_dx  + s.Ex*dxi_dy)
+        dt_Bx  = -dEz_dy + dEy_dz + dPhi_dx
+        dt_By  = -dEx_dz + dEz_dx + dPhi_dy
+        dt_Bz  = -dEy_dx + dEx_dy + dPhi_dz
+        dt_xi  = -s.Pi * cs
+        dt_Pi  = (-d2xi_dx2 - d2xi_dy2 - d2xi_dz2 + 2*L*(s.Bx*s.Ex + s.By*s.Ey + s.Bz*s.Ez)) * cs
+        dt_Psi = -dEx_dx - dEy_dy - dEz_dz - self.K1*s.Psi - cs*2*L*(s.Bx*dxi_dx + s.By*dxi_dy + s.Bz*dxi_dz)
+        dt_Phi =  dBx_dx + dBy_dy + dBz_dz - self.K2*s.Phi
+
+        dt_data = jnp.stack([dt_Ex, dt_Ey, dt_Ez, dt_Bx, dt_By, dt_Bz,
+                              dt_xi, dt_Pi, dt_Psi, dt_Phi])
+
         if self.ko_sigma > 0:
-            dt_data += jax.vmap(self.apply_ko)(s.data)
-            
-        dt_data -= (self.sponge_strength * self.sponge_mask) * s.data
+            ko = (self._ko_batched(s.data, self.dx, self.ko_sigma, axis=0) +
+                  self._ko_batched(s.data, self.dy, self.ko_sigma, axis=1) +
+                  self._ko_batched(s.data, self.dz, self.ko_sigma, axis=2))
+            dt_data += jax.vmap(self.bc_zero)(ko)
 
-        # 4. Final Boundary Enforcement
-        for i in [self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ, self.PSI, self.PHI, self.XI, self.PI]:
-            if bc_type == "periodic":
-                dt_data = dt_data.at[i].set(self.bc_periodic(dt_data[i]))
-            else:
+        if bc_type == "periodic":
+            dt_data = jax.vmap(self.bc_periodic)(dt_data)
+        else:
+            for i in [self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ,
+                      self.PSI, self.PHI, self.XI, self.PI]:
                 if i in [self.XI, self.PI]:
                     dt_data = dt_data.at[i].set(self.bc_zero(dt_data[i]))
                 else:
@@ -360,12 +364,12 @@ def load_parameters(parfile: str) -> Dict[str, Any]:
     print(f">> WARNING: Parameter file '{parfile}' not found. Using defaults.")
     return {
         "Nx": 64, "Ny": 64, "Nz": 64, "Nt": 1000, "output_interval": 10,
-        "cfl": 0.05, "ko_sigma": 0.05, "Lambda": 0.1, 
+        "cfl": 0.05, "ko_sigma": 0.05, "Lambda": 0.1, "Order": 6,
         "enable_cs": 1.0, "sponge_strength": 10.0,
-        "scheme": "floating_point", 
+        "scheme": "floating_point",
         "id_amp": 0.8, "id_sigma": 0.5, "id_y0": 0.0, "id_x0": 0.0, "id_z0": 0.0,
         "xmin": -5.0, "xmax": 5.0, "ymin": -5.0, "ymax": 5.0, "zmin": -5.0, "zmax": 5.0,
-        "K1": 100.0, "K2": 100.0  
+        "K1": 100.0, "K2": 100.0
     }
 
 def main(parfile: str, output_dir: str):
@@ -414,8 +418,8 @@ def main(parfile: str, output_dir: str):
         print(f"\n>> Simulation complete. XDMF metadata written to {output_dir}")
 
 if __name__ == "__main__":
-    par = sys.argv[1] if len(sys.argv) > 1 else "Utils/params.toml"
-    out = sys.argv[2] if len(sys.argv) > 2 else "Maxwell-Chern-Simons_3D/mcs_data"
+    par = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent / "params.toml")
+    out = sys.argv[2] if len(sys.argv) > 2 else str(Path(__file__).resolve().parent / "output")
     
     if os.path.exists(out):
         print(f">> Removing previous run data in: {out}")

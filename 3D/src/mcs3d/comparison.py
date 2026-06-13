@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,7 +12,7 @@ jax.config.update("jax_enable_x64", True)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 # Import your existing 3D simulation classes
-from main import (
+from mcs3d.main import (
     MaxwellChernSimons3D, 
     InitialData, 
     calc_constraints, 
@@ -47,7 +48,7 @@ class MCSBirefringentWave3D:
 
 def main():
     # 1. Setup Parameters
-    parfile = sys.argv[1] if len(sys.argv) > 1 else "Utils/params.toml"
+    parfile = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent / "params.toml")
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "Maxwell-Chern-Simons_3D"
     os.makedirs(out_dir, exist_ok=True)
     

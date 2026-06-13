@@ -1,0 +1,3 @@
+scheme,nx,compile_s,per_step_us,rhs_per_step_us,throughput_Mpts_s,end_to_end_s_N2000,state_MB,peak_device_MB,l2_err,rhs_GFLOP,rhs_MB_accessed,rhs_flop_per_byte,bound,step_GFLOP,step_MB_accessed,step_flop_per_byte,achieved_GFLOPs,achieved_GBs,speedup_step_vs_fp,speedup_rhs_vs_fp,bw_eff_pct
+fused_floating_point,256,0.40420044600614347,290.0016002240591,49.529570096638054,225.9849599083799,0.9842036464542616,5.49,49.6,9.659895667507385e-13,0.0864,27.12,3.187,memory,0.4384,602.54,0.728,1511.7,2077.7,1.0,1.0,43.3
+fused_floating_point,512,0.47750411997549236,1159.9465101608075,180.2989700809121,225.99662803732048,2.7973971402971074,21.47,219.0,1.516912995655759e-14,0.3084,95.81,3.218,memory,1.7204,2573.91,0.668,1483.2,2219.0,1.0,1.0,46.2

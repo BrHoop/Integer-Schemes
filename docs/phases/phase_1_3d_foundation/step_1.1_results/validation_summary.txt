@@ -1,0 +1,33 @@
+MCS 3D — Phase 1 validation summary
+======================================
+
+Spatial convergence order vs 10-field oracle (fixed physical time):
+  [1] STENCIL (6th-order FD, KO off)        -- the scheme's true order
+        Ex : p = 5.94
+        Ey : p = 5.94
+        Ez : p = 5.94
+        Bx : p = 5.94
+        By : p = 5.94
+        Bz : p = 5.94
+  [2] PRODUCTION (KO on, CFL=0.05)          -- KO-limited (O(h^5) dissipation)
+        Ex : p = 5.68
+        Ey : p = 5.68
+        Ez : p = 5.68
+        Bx : p = 5.79
+        By : p = 5.79
+        Bz : p = 5.79
+  [3] RK4 TEMPORAL FLOOR (CFL=0.40)         -- binds only at large CFL
+        Ez : p = 4.13
+
+Spectral certificates (CFJ-aware; see notes):
+  max Re(lambda) [Lambda=0.4, CFJ band present] : 3.285e-01
+  max RK4 |G(k)| at CFL                         : 1.005490
+  strong-hyperbolicity cond number (worst dir)  : 4.81
+  CFJ onset m_cs                                : 0.800
+  growing modes below/above m_cs                : 1 / 0
+
+Long-run monitor (Lambda=0.2, stable regime):
+  final L2(Ez - oracle)   : 3.541e-06
+  final L2(divB)          : 6.609e-16
+  final max|E,B|          : 0.653
+

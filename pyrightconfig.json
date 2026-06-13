@@ -1,0 +1,10 @@
+{
+  "//": "Tracked Pylance/Pyright config. Exclude the machine-generated BSSN algebra files (single expressions up to ~10k chars) and the XLA dump dir from analysis — analyzing them crashes the language server. They are correct-by-construction (regen + bit-compare gated), so they need no editor type-checking.",
+  "exclude": [
+    "**/bssn_xla_dump",
+    "**/_bssn_rhs_generated.py",
+    "**/_constraints_generated.py",
+    "**/__pycache__",
+    "**/.venv"
+  ]
+}

@@ -1,0 +1,35 @@
+MCS 2D — Step 1.1 validation summary
+======================================
+
+Spatial convergence order vs 10-field oracle (fixed physical time):
+  [1] STENCIL (6th-order FD, KO off)        -- the scheme's true order
+        Ex : p = 5.99
+        Ey : p = 5.99
+        Ez : p = 5.99
+        Bx : p = 5.99
+        By : p = 5.99
+        Bz : p = 5.99
+  [2] PRODUCTION (KO on, CFL=0.05)          -- KO-limited (O(h^5) dissipation)
+        Ex : p = 5.31
+        Ey : p = 5.31
+        Ez : p = 5.31
+        Bx : p = 5.53
+        By : p = 5.53
+        Bz : p = 5.53
+  [3] RK4 TEMPORAL FLOOR (CFL=0.40)         -- binds only at large CFL
+        Ez : p = 4.06
+  (stencil is 6th order; default 6th-order KO caps production at ~5th;
+   RK4's 4th-order floor never binds at the operating CFL=0.05.)
+
+Spectral certificates (CFJ-aware; see notes):
+  max Re(lambda) [Lambda=0.4, CFJ band present] : 3.284e-01
+  max RK4 |G(k)| at CFL                         : 1.005145
+  strong-hyperbolicity cond number (worst dir)  : 3.88
+  CFJ onset m_cs                                : 0.800
+  growing modes below/above m_cs                : 1 / 0
+
+Long-run monitor (Lambda=0.2, stable regime):
+  final L2(Ez - oracle)   : 2.308e-08
+  final L2(divB)          : 9.434e-16
+  final max|E,B|          : 0.799
+

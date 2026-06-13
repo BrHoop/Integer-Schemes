@@ -1,0 +1,35 @@
+# Python / build artefacts
+.venv/
+*.egg-info/
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# Git / IDE / tooling
+.git/
+.gitignore
+.rsyncignore
+.claude/
+
+# Simulation output (large; use ./sync.sh pull to retrieve)
+mcs2d/output/
+mcs3d/output/
+*.h5
+*.xdmf
+*.gif
+
+# Test logs (use ./sync.sh pull logs to retrieve)
+*.log
+
+# Profiler traces (use ./sync.sh pull traces to retrieve)
+traces/
+
+# Validation + GPU-profiling deliverables. Excluded from push so the GPU's
+# regenerated results are NOT clobbered or --deleted by a code sync; the harness
+# recreates this dir on the remote. Retrieve with ./sync.sh pull results.
+docs/phases/phase_1_stencil_core/step_1.1_results/
+# Generated profiling output dir (benchmark.py default location).
+2D/src/mcs2d/output/
+
+# BSSN spill-probe XLA dump (regenerated each run)
+bssn_xla_dump/

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcs3d"
+version = "0.2.0"
+description = "3D Maxwell-Chern-Simons solver."
+# Pinned to JAX 0.9.2.  See 2D/pyproject.toml for the Pallas-Triton 0.9.x notes.
+dependencies = [
+    "jax == 0.9.2",
+    "numpy",
+    "h5py",
+    "matplotlib",
+    "mcs-common",
+]
+
+[project.optional-dependencies]
+gpu = ["jax[cuda12] == 0.9.2"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: tests that take longer than ~5 s",
+    "gpu: requires a real GPU (skipped on CPU-only CI)",
+]

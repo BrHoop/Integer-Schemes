@@ -218,6 +218,24 @@ class OzakiDerivative3D:
                                         self.c.basis_full, self.c.M_prod_full)
         return out_int * (2.0 ** exponent)
 
+    def _extract_patches(self, u_pad, nbx, nby, nbz):
+        """Extract overlapping 3D patches via lax.dynamic_slice (no cuDNN dependency)."""
+        patch_size = self.bs + 2 * self.ng
+        ii, jj, kk = jnp.meshgrid(
+            jnp.arange(nbx, dtype=jnp.int32),
+            jnp.arange(nby, dtype=jnp.int32),
+            jnp.arange(nbz, dtype=jnp.int32),
+            indexing='ij'
+        )
+        starts = jnp.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=1)  # (n_patches, 3)
+        def extract_one(ijk):
+            return lax.dynamic_slice(
+                u_pad,
+                (ijk[0] * self.bs, ijk[1] * self.bs, ijk[2] * self.bs),
+                (patch_size, patch_size, patch_size)
+            )
+        return vmap(extract_one)(starts)  # (n_patches, patch_size, patch_size, patch_size)
+
     def _apply_pipeline(self, u, D_mods, divisor, axis):
         """Handles 3D grid patching, compiling the Ozaki math, and unpatching."""
         nx, ny, nz = u.shape
@@ -231,19 +249,12 @@ class OzakiDerivative3D:
         nbx = u_aligned.shape[0] // self.bs
         nby = u_aligned.shape[1] // self.bs
         nbz = u_aligned.shape[2] // self.bs
-        patch_size = self.bs + 2 * self.ng
 
         # 1. Pad for the stencil halo in 3D
         u_pad = jnp.pad(u_aligned, ((self.ng, self.ng), (self.ng, self.ng), (self.ng, self.ng)), mode='edge')
-        
-        # 2. Extract 3D Patches using NDHWC format
-        patches = lax.conv_general_dilated_patches(
-            u_pad[None, :, :, :, None], 
-            (patch_size, patch_size, patch_size), 
-            (self.bs, self.bs, self.bs), 
-            padding="VALID",
-            dimension_numbers=('NDHWC', 'OIDHW', 'NDHWC')
-        ).reshape(-1, patch_size, patch_size, patch_size)
+
+        # 2. Extract 3D patches via lax.dynamic_slice (CUDA-graph-compatible, no cuDNN)
+        patches = self._extract_patches(u_pad, nbx, nby, nbz)
 
         # 3. Map the Ozaki kernel over all blocks
         wgmma_fn = lambda b: self._ozaki_contract(b, D_mods, axis)
@@ -267,4 +278,5 @@ class OzakiDerivative3D:
         return self._apply_pipeline(u, self.D_d2_mods, 5040.0 * (dx**2), axis)
 
     def compute_ko(self, u, dx, sigma, axis):
-        return self._apply_pipeline(u, self.D_ko_mods, 256.0 / sigma, axis)
+        # Divisor matches floating_point.py: CKO/256 * sigma/dx → pipeline divisor = 256*dx/sigma
+        return self._apply_pipeline(u, self.D_ko_mods, 256.0 * dx / sigma, axis)

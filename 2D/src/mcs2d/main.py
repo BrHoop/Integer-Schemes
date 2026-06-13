@@ -7,20 +7,21 @@ import shutil
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
-import jax
-jax.config.update("jax_enable_x64", True)
-
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 root_dir = str(Path(__file__).resolve().parent.parent)
 if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
+from mcs_common.jax_config import setup as _jax_setup
+_jax_setup()           # x64 + persistent compile cache, before any jit
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 
-import Utils.ioxdmf as iox
-from Utils.wave_state import WaveState
+import mcs_common.ioxdmf as iox
+from mcs_common.wave_state import WaveState
 
 class InitialData:
     """Generates initial conditions for the 2D wave simulation."""
@@ -98,7 +99,6 @@ class InitialData:
         By = (-k_x * Ez) / omega_minus
         Bz = (k_x * Ey - k_y * Ex) / omega_minus
         
-        # THE FIX: Calculate the required Pi field to sustain the m_cs background
         Pi_0 = m_cs / (2.0 * cs * L_param)
         
         data = jnp.zeros((10, self.sim.Nx_tot, self.sim.Ny_tot), dtype=jnp.float64)
@@ -130,25 +130,37 @@ class MaxwellChernSimons2D:
         self.Lambda = Lambda
         self.params = params
         self.dt = params["cfl"] * dx
-        self.order = params["Order"]
+        self.order = params.get("Order", 6)   # only 6th-order is implemented
         
         self.scheme = params.get("scheme", "floating_point").lower()
         self._init_derivative_operator()
         self.ng = self.diff_op.ng 
 
         self._init_grid(params)
-        self._init_sponge(params)
-
         self.K1 = params.get("K1", 100.0)
         self.K2 = params.get("K2", 100.0)
         self.ko_sigma = params.get("ko_sigma", 0.05)
+        if self.scheme in ("fused_ozaki", "fused_floating_point", "pallas_ozaki"):
+            self._init_fused_kernel()
 
     def _init_derivative_operator(self):
-        if self.scheme == "ozaki":
-            from ozaki import OzakiDerivative
-            self.diff_op = OzakiDerivative(block_size=64, halo=4)
+        from mcs2d.schemes.floating_point import SpatialDerivative as FloatDerivative
+        mods_ext = self.params.get("ozaki_mods_ext", None)
+        if self.scheme == "compact":
+            from mcs2d.schemes.compact import CompactDerivative
+            self.diff_op = CompactDerivative(
+                order=self.params.get("compact_order", 6),
+                ko_order=self.params.get("compact_ko_order", None))
+        elif self.scheme == "ozaki":
+            from mcs2d.schemes.ozaki import OzakiDerivative
+            self.diff_op = OzakiDerivative(block_size=64, halo=3, mods_ext=mods_ext)
+        elif self.scheme in ("fused_ozaki", "fused_floating_point", "pallas_ozaki"):
+            # diff_op used only for single-field calls (BC, constraints); main
+            # RHS is handled by the fused kernel built in _init_fused_kernel.
+            self.diff_op = FloatDerivative(order=self.order)
+            self._fused_rhs_fn  = None
+            self._fused_step_fn = None
         else:
-            from floating_point import SpatialDerivative as FloatDerivative
             self.diff_op = FloatDerivative(order=self.order)
 
     def _init_grid(self, p: Dict[str, Any]):
@@ -161,21 +173,67 @@ class MaxwellChernSimons2D:
         self.X, self.Y = jnp.meshgrid(self.x, self.y, indexing='ij')
         self.R = jnp.sqrt(self.X**2 + self.Y**2) + 1e-15
 
-    def _init_sponge(self, p: Dict[str, Any]):
-        width = 0.1 * (p["xmax"] - p["xmin"])
-        dist_x = jnp.maximum(0.0, jnp.abs(self.x) - (p["xmax"] - width))
-        dist_y = jnp.maximum(0.0, jnp.abs(self.y) - (p["ymax"] - width))
-        mask = (dist_x[:, None] / width)**2 + (dist_y[None, :] / width)**2
-        self.sponge_mask = jnp.clip(mask, 0.0, 1.0)
-        self.sponge_strength = p.get("sponge_strength", 10.0)
+    def _init_fused_kernel(self):
+        bc_type = self.params.get("bc_type", "sommerfeld")
+        args = (
+            self.Nx_tot, self.Ny_tot,
+            self.dx, self.dy,
+            self.params.get("enable_cs", 1.0),
+            self.Lambda,
+            self.K1, self.K2,
+            self.ko_sigma,
+        )
+        # Temporally fused full-step args (all 4 RK4 stages in one HBM pass).
+        # Periodic BC only — the step kernels wrap the interior internally.
+        step_args = (
+            self.Nx_tot, self.Ny_tot, self.ng,
+            self.dx, self.dy,
+            self.params.get("enable_cs", 1.0), self.Lambda,
+            self.K1, self.K2, self.ko_sigma, self.dt,
+        )
+        self._fused_step_fn = None
+        mods_ext = self.params.get("ozaki_mods_ext", None)
+        if self.scheme == "fused_ozaki":
+            from mcs2d.schemes.fused_rhs_ozaki import make_fused_ozaki_rhs, make_fused_ozaki_step
+            self._fused_rhs_fn = make_fused_ozaki_rhs(*args, mods_ext=mods_ext)
+            if bc_type == "periodic":
+                self._fused_step_fn = make_fused_ozaki_step(*step_args, mods_ext=mods_ext)
+        elif self.scheme == "pallas_ozaki":
+            # Single Pallas kernel per tile — entire CRT in shared memory.
+            # No temporal step yet (Phase B); RK4 stages call rhs 4× as standard.
+            from mcs2d.schemes.pallas_ozaki import make_pallas_ozaki_rhs
+            self._fused_rhs_fn = make_pallas_ozaki_rhs(*args, mods_ext=mods_ext)
+        else:  # fused_floating_point
+            from mcs2d.schemes.fused_rhs_fp import make_fused_rhs, make_fused_step
+            self._fused_rhs_fn = make_fused_rhs(*args)
+            if bc_type == "periodic":
+                self._fused_step_fn = make_fused_step(*step_args)
 
     def d_dx(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d1(u, self.dx, axis=0)
     def d_dy(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d1(u, self.dy, axis=1)
     def d2_dx2(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d2(u, self.dx, axis=0)
     def d2_dy2(self, u: jnp.ndarray) -> jnp.ndarray: return self.diff_op.compute_d2(u, self.dy, axis=1)
 
+    def _d1_batched(self, u_batch: jnp.ndarray, dx: float, axis: int) -> jnp.ndarray:
+        """First derivative over all F fields. u_batch: (F, Nx, Ny) → (F, Nx, Ny)."""
+        if hasattr(self.diff_op, 'compute_d1_batched'):
+            return self.diff_op.compute_d1_batched(u_batch, dx, axis)
+        return jax.vmap(lambda u: self.diff_op.compute_d1(u, dx, axis))(u_batch)
+
+    def _d2_batched(self, u_batch: jnp.ndarray, dx: float, axis: int) -> jnp.ndarray:
+        """Second derivative over all F fields. u_batch: (F, Nx, Ny) → (F, Nx, Ny)."""
+        if hasattr(self.diff_op, 'compute_d2_batched'):
+            return self.diff_op.compute_d2_batched(u_batch, dx, axis)
+        return jax.vmap(lambda u: self.diff_op.compute_d2(u, dx, axis))(u_batch)
+
+    def _ko_batched(self, u_batch: jnp.ndarray, dx: float, sigma: float, axis: int) -> jnp.ndarray:
+        """KO dissipation over all F fields. u_batch: (F, Nx, Ny) → (F, Nx, Ny)."""
+        if hasattr(self.diff_op, 'compute_ko_batched'):
+            return self.diff_op.compute_ko_batched(u_batch, dx, sigma, axis)
+        return jax.vmap(lambda u: self.diff_op.compute_ko(u, dx, sigma, axis))(u_batch)
+
     def apply_ko(self, u: jnp.ndarray) -> jnp.ndarray:
-        ko = (self.diff_op.compute_ko(u, self.dx, self.ko_sigma, axis=0) + 
+        ko = (self.diff_op.compute_ko(u, self.dx, self.ko_sigma, axis=0) +
               self.diff_op.compute_ko(u, self.dy, self.ko_sigma, axis=1))
         return self.bc_zero(ko)
 
@@ -214,31 +272,48 @@ class MaxwellChernSimons2D:
         
         return field
     
-    def bc_directional(self, u: jnp.ndarray, dtu: jnp.ndarray) -> jnp.ndarray:
-        """Advective boundary condition that perfectly swallows a specific plane wave."""
-        v_x = self.params.get("v_x", 1.0)
-        v_y = self.params.get("v_y", 1.0)
-
-        # 1st-order upwind stencils (identical to your Sommerfeld setup)
-        du_dx_f = (jnp.roll(u, -1, axis=0) - u) / self.dx
-        du_dx_b = (u - jnp.roll(u, 1, axis=0)) / self.dx
-        du_dy_f = (jnp.roll(u, -1, axis=1) - u) / self.dy
-        du_dy_b = (u - jnp.roll(u, 1, axis=1)) / self.dy
-        du_dx_c, du_dy_c = self.d_dx(u), self.d_dy(u)
-
-        # The new directional advection math
-        def calc_bc(slc, dx_op, dy_op):
-            return -v_x * dx_op[slc] - v_y * dy_op[slc]
-
-        # Apply to the ghost zones
-        dtu = dtu.at[:self.ng, :].set(calc_bc(jnp.s_[:self.ng, :], du_dx_f, du_dy_c))
-        dtu = dtu.at[-self.ng:, :].set(calc_bc(jnp.s_[-self.ng:, :], du_dx_b, du_dy_c))
-        dtu = dtu.at[:, -self.ng:].set(calc_bc(jnp.s_[:, -self.ng:], du_dx_c, du_dy_b))
-        dtu = dtu.at[:, :self.ng].set(calc_bc(jnp.s_[:, :self.ng], du_dx_c, du_dy_f))
-        
-        return dtu
-
     def rhs(self, state: WaveState) -> WaveState:
+        if self.scheme in ("fused_ozaki", "fused_floating_point", "pallas_ozaki"):
+            return self._rhs_fused(state)
+        return self._rhs_unfused(state)
+
+    def _rhs_fused(self, state: WaveState) -> WaveState:
+        """RHS via fused tile kernel.
+
+        Both fused RHS kernels pad with mode='edge', so periodic BC requires
+        an explicit ghost-zone sync before and after the kernel call.
+
+        Sommerfeld: no pre-sync; apply ghost-zone override to dt_data after the
+        kernel.
+
+        (Note: for fused_floating_point + periodic, step_rk4 uses the
+        temporally fused step kernel and bypasses this method entirely; this
+        path is still exercised by direct rhs() calls, e.g. in tests.)
+        """
+        bc_type = self.params.get("bc_type", "sommerfeld")
+
+        need_sync = (bc_type == "periodic")
+
+        data = state.data
+        if need_sync:
+            data = jax.vmap(self.bc_periodic)(data)
+
+        dt_data = self._fused_rhs_fn(data)
+
+        if need_sync:
+            dt_data = jax.vmap(self.bc_periodic)(dt_data)
+        elif bc_type != "periodic":
+            s = state
+            for i in [self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ,
+                      self.PSI, self.PHI, self.XI, self.PI]:
+                if i in [self.XI, self.PI]:
+                    dt_data = dt_data.at[i].set(self.bc_zero(dt_data[i]))
+                else:
+                    dt_data = dt_data.at[i].set(self.bc_sommerfeld(s.data[i], dt_data[i]))
+
+        return WaveState(dt_data)
+
+    def _rhs_unfused(self, state: WaveState) -> WaveState:
         cs = self.params.get("enable_cs", 1.0)
         L = self.Lambda
         bc_type = self.params.get("bc_type", "sommerfeld")
@@ -246,51 +321,65 @@ class MaxwellChernSimons2D:
         synced_data = state.data
         if bc_type == "periodic":
             synced_data = jax.vmap(self.bc_periodic)(synced_data)
-        
+
         s = WaveState(synced_data)
 
-        dt_Ex = self.d_dy(s.Bz) - self.d_dx(s.Psi) - cs*2*L*(s.Pi*s.Bx - s.Ez*self.d_dy(s.xi))
-        dt_Ey = -self.d_dx(s.Bz) - self.d_dy(s.Psi) - cs*2*L*(s.Pi*s.By + s.Ez*self.d_dx(s.xi))
-        dt_Ez = self.d_dx(s.By) - self.d_dy(s.Bx) - cs*2*L*(s.Pi*s.Bz + s.Ex*self.d_dy(s.xi) - s.Ey*self.d_dx(s.xi))
-        
-        dt_Bx, dt_By = -self.d_dy(s.Ez) + self.d_dx(s.Phi), self.d_dx(s.Ez) + self.d_dy(s.Phi)
-        dt_Bz = -self.d_dx(s.Ey) + self.d_dy(s.Ex)
-        
-        dt_xi = -s.Pi * cs
-        dt_Pi = (-self.d2_dx2(s.xi) - self.d2_dy2(s.xi) + 2*L*(s.Bx*s.Ex + s.By*s.Ey + s.Bz*s.Ez)) * cs
-        
-        dt_Psi = -self.d_dx(s.Ex) - self.d_dy(s.Ey) - self.K1*s.Psi - cs*2*L*(s.Bx*self.d_dx(s.xi) + s.By*self.d_dy(s.xi))
-        dt_Phi = self.d_dx(s.Bx) + self.d_dy(s.By) - self.K2 * s.Phi
+        # Batch all first-derivative fields into two calls (one per axis) instead of ~18.
+        # PI (index 7) is never differentiated — it only appears as a multiplier — so exclude it.
+        # Batch order: EX=0, EY=1, EZ=2, BX=3, BY=4, BZ=5, XI=6, PSI=7, PHI=8 (9 fields)
+        _d1_idx = jnp.array([self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ,
+                              self.XI, self.PSI, self.PHI])
+        d1_in = s.data[_d1_idx]                               # (9, Nx, Ny)
+        dx_all = self._d1_batched(d1_in, self.dx, axis=0)     # (9, Nx, Ny)
+        dy_all = self._d1_batched(d1_in, self.dy, axis=1)     # (9, Nx, Ny)
+
+        dEx_dx, dEy_dx, dEz_dx, dBx_dx, dBy_dx, dBz_dx, dxi_dx, dPsi_dx, dPhi_dx = dx_all
+        dEx_dy, dEy_dy, dEz_dy, dBx_dy, dBy_dy, dBz_dy, dxi_dy, dPsi_dy, dPhi_dy = dy_all
+
+        d2xi_dx2 = self.diff_op.compute_d2(s.xi, self.dx, axis=0)
+        d2xi_dy2 = self.diff_op.compute_d2(s.xi, self.dy, axis=1)
+
+        dt_Ex  = dBz_dy  - dPsi_dx - cs*2*L*(s.Pi*s.Bx - s.Ez*dxi_dy)
+        dt_Ey  = -dBz_dx - dPsi_dy - cs*2*L*(s.Pi*s.By + s.Ez*dxi_dx)
+        dt_Ez  = dBy_dx  - dBx_dy  - cs*2*L*(s.Pi*s.Bz + s.Ex*dxi_dy - s.Ey*dxi_dx)
+        dt_Bx  = -dEz_dy + dPhi_dx
+        dt_By  =  dEz_dx + dPhi_dy
+        dt_Bz  = -dEy_dx + dEx_dy
+        dt_xi  = -s.Pi * cs
+        dt_Pi  = (-d2xi_dx2 - d2xi_dy2 + 2*L*(s.Bx*s.Ex + s.By*s.Ey + s.Bz*s.Ez)) * cs
+        dt_Psi = -dEx_dx - dEy_dy - self.K1*s.Psi - cs*2*L*(s.Bx*dxi_dx + s.By*dxi_dy)
+        dt_Phi =  dBx_dx + dBy_dy - self.K2 * s.Phi
 
         dt_data = jnp.stack([dt_Ex, dt_Ey, dt_Ez, dt_Bx, dt_By, dt_Bz, dt_xi, dt_Pi, dt_Psi, dt_Phi])
 
-        for i in [self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ, self.PSI, self.PHI, self.XI, self.PI]:
-            if bc_type == "periodic":
-                dt_data = dt_data.at[i].set(self.bc_periodic(dt_data[i]))
-            elif bc_type == "directional":
-                if i in [self.XI, self.PI]:
-                    dt_data = dt_data.at[i].set(self.bc_zero(dt_data[i]))
-                else:
-                    # Swallow the wave in a straight line!
-                    dt_data = dt_data.at[i].set(self.bc_directional(s.data[i], dt_data[i]))
-            else:
+        if bc_type == "periodic":
+            dt_data = jax.vmap(self.bc_periodic)(dt_data)
+        else:
+            for i in [self.EX, self.EY, self.EZ, self.BX, self.BY, self.BZ, self.PSI, self.PHI, self.XI, self.PI]:
                 if i in [self.XI, self.PI]:
                     dt_data = dt_data.at[i].set(self.bc_zero(dt_data[i]))
                 else:
                     dt_data = dt_data.at[i].set(self.bc_sommerfeld(s.data[i], dt_data[i]))
 
         if self.ko_sigma > 0:
-            dt_data += jax.vmap(self.apply_ko)(s.data)
-            
-        dt_data -= (self.sponge_strength * self.sponge_mask) * state.data
+            ko = (self._ko_batched(s.data, self.dx, self.ko_sigma, axis=0) +
+                  self._ko_batched(s.data, self.dy, self.ko_sigma, axis=1))
+            dt_data += jax.vmap(self.bc_zero)(ko)
+
         return WaveState(dt_data)
 
     def step_rk4(self, state: WaveState, dt: float) -> WaveState:
+        # Temporally fused path: all 4 RK4 stages run inside a single tiled
+        # pass — state is read from HBM exactly once.  Available only for
+        # fused_floating_point with periodic BC.
+        if getattr(self, '_fused_step_fn', None) is not None:
+            return WaveState(self._fused_step_fn(state.data))
+
         k1 = self.rhs(state)
         k2 = self.rhs(jax.tree_util.tree_map(lambda s, k: s + 0.5 * dt * k, state, k1))
         k3 = self.rhs(jax.tree_util.tree_map(lambda s, k: s + 0.5 * dt * k, state, k2))
         k4 = self.rhs(jax.tree_util.tree_map(lambda s, k: s + dt * k, state, k3))
-        
+
         return jax.tree_util.tree_map(
             lambda s, v1, v2, v3, v4: s + (dt / 6.0) * (v1 + 2*v2 + 2*v3 + v4),
             state, k1, k2, k3, k4
@@ -333,12 +422,13 @@ def load_parameters(parfile: str) -> Dict[str, Any]:
             return tomllib.load(f)
     return {
         "Nx": 256, "Ny": 256, "Nt": 1000, "output_interval": 10,
-        "cfl": 0.05, "ko_sigma": 0.05, "Lambda": 0.1, 
+        "Order": 6,
+        "cfl": 0.05, "ko_sigma": 0.05, "Lambda": 0.1,
         "enable_cs": 1.0, "sponge_strength": 10.0,
-        "scheme": "floating_point", 
+        "scheme": "fused_floating_point",
         "id_amp": 0.8, "id_sigma": 0.5, "id_y0": 0.0, "id_x0": 0.0,
         "xmin": -5.0, "xmax": 5.0, "ymin": -5.0, "ymax": 5.0,
-        "K1": 100.0, "K2": 100.0  
+        "K1": 100.0, "K2": 100.0
     }
 
 def main(parfile: str, output_dir: str):
@@ -346,8 +436,8 @@ def main(parfile: str, output_dir: str):
     nx, ny = params["Nx"], params["Ny"]    
     nt, out_int = params["Nt"], params["output_interval"]
     
-    dx = (params["xmax"] - params["xmin"]) / (nx - 1)
-    dy = (params["ymax"] - params["ymin"]) / (ny - 1)
+    dx = (params["xmax"] - params["xmin"]) / nx
+    dy = (params["ymax"] - params["ymin"]) / ny
 
     sim = MaxwellChernSimons2D(dx, dy, params.get("Lambda", 0.1), params)
     state = InitialData(sim, params).generate()
@@ -377,8 +467,8 @@ def main(parfile: str, output_dir: str):
         print(f"\n>> Simulation complete. XDMF metadata written to {output_dir}")
 
 if __name__ == "__main__":
-    par = sys.argv[1] if len(sys.argv) > 1 else "Utils/params.toml"
-    out = sys.argv[2] if len(sys.argv) > 2 else "Maxwell-Chern-Simons_2D/mcs_data"
+    par = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parent / "params.toml")
+    out = sys.argv[2] if len(sys.argv) > 2 else str(Path(__file__).resolve().parent / "output")
     
     if os.path.exists(out):
         print(f">> Wiping previous run data in: {out}")
