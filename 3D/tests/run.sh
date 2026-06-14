@@ -12,6 +12,7 @@ case "$CATEGORY" in
   integration) TARGET=(tests/integration/) ;;
   regression)  TARGET=(tests/regression/) ;;
   validation)  TARGET=(tests/validation/) ;;
+  multipatch)  TARGET=(tests/multipatch_grid/) ;;
   fast)        TARGET=(tests/ -m "not slow") ;;
   *)           echo "unknown category: $CATEGORY"; exit 2 ;;
 esac
