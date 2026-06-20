@@ -44,9 +44,20 @@ def _select_algebra(scheme: str):
         # fp64 + SMEM-trunk sibling of "fused" (no-fp32 path); same call path.
         from ._bssn_rhs_fused_fp64 import bssn_rhs_fused_fp64
         return bssn_rhs_fused_fp64
+    if scheme == "fused_tiled":
+        # Step 3.2d Increment 2: derivatives on-chip over pow2 tiles via L2-served
+        # pl.ds windows (single HBM grid copy) + fp32 algebra; same fused call path.
+        from ._bssn_rhs_fused_tiled import bssn_rhs_fused_tiled
+        return bssn_rhs_fused_tiled
+    if scheme == "cuda_fused":
+        # M4 (the Phase-3 win): the fused CUDA RHS via JAX FFI — per-point derivs in
+        # registers + the 1c algebra, one kernel, no deriv HBM round-trip. Same fused
+        # call path (fields + spacings, no D). 2.28× vs verbatim @136³ on H100.
+        from .fused_rhs_cuda import cuda_fused_algebra
+        return cuda_fused_algebra
     raise ValueError(
         f"unknown scheme {scheme!r} (use 'verbatim', 'staged', 'pallas', "
-        f"'fused', or 'fused_fp64')")
+        f"'fused', 'fused_fp64', or 'fused_tiled')")
 
 
 class BSSNSolver:
@@ -63,7 +74,7 @@ class BSSNSolver:
 
     def __init__(self, grid: Grid, params: PhysicsParams = None, order: int = 6,
                  dt: float = None, scheme: str = "verbatim",
-                 precision: str = "fp64"):
+                 precision: str = "fp64", ko_order: int = 8):
         self.grid = grid
         self.params = params or PhysicsParams()
         self.scheme = scheme
@@ -77,10 +88,11 @@ class BSSNSolver:
             raise ValueError(f"unknown precision {precision!r}")
         self.precision = precision
         self._algebra = _select_algebra(scheme)
-        self.diff_op = SpatialDerivative(order=order)
-        if self.diff_op.ng != grid.ng:
+        self.diff_op = SpatialDerivative(order=order, ko_order=ko_order)
+        if self.diff_op.ng > grid.ng:
             raise ValueError(
-                f"FD order {order} needs ng={self.diff_op.ng} but grid has ng={grid.ng}."
+                f"FD order {order} / KO order {ko_order} need ng>={self.diff_op.ng} "
+                f"but grid has ng={grid.ng}."
             )
         # Default step for the CAHD dx^2/dt factor when no stepper supplies one
         # (e.g. the spill probe, or a static-RHS eval). A CFL-ish 0.25*dx keeps the
@@ -97,7 +109,7 @@ class BSSNSolver:
         g = self.grid
         p = self.params
         F = field_dict(state)
-        if self.scheme in ("fused", "fused_fp64"):
+        if self.scheme in ("fused", "fused_fp64", "fused_tiled", "cuda_fused"):
             # The fused kernels compute the FD bundle on-chip (no derivative_bundle,
             # no HBM round-trip for the 138 derivatives). "fused" selects fp32 via
             # BSSN_PALLAS_FP32 (FD stays fp64 there); "fused_fp64" is fp64-locked with

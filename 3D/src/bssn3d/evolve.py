@@ -24,14 +24,42 @@ from .rhs import BSSNSolver
 class BSSNEvolution:
     def __init__(self, grid: Grid, params: PhysicsParams = None, order: int = 6,
                  ko_sigma: float = 0.0, bc: str = "periodic",
-                 precision: str = "fp64"):
+                 precision: str = "fp64", scheme: str = "verbatim", ko_order: int = 8,
+                 integrator: str = "rk4"):
         self.grid = grid
         self.params = params or PhysicsParams()
-        self.solver = BSSNSolver(grid, self.params, order, precision=precision)
+        # ``scheme`` selects the RHS algebra variant (verbatim oracle vs the Phase-3
+        # staged/pallas/fused kernels) so the full RK4-step evolution — and the
+        # apples/long-run accuracy checks — can run on the optimized kernels, not
+        # only the verbatim baseline. Defaults to verbatim (the bit-compared anchor).
+        self.scheme = scheme
+        self.solver = BSSNSolver(grid, self.params, order,
+                                 precision=precision, scheme=scheme, ko_order=ko_order)
         self.diff_op = self.solver.diff_op
         self.ng = grid.ng
         self.ko_sigma = ko_sigma
         self.bc = bc
+        # ``integrator`` (Phase-4.C): "rk4" (4 evals/step) or a 2-step/3-stage MSRK
+        # ("rk4_2_2" recommended; "rk4_2_1") that reuses the previous step's RHS to do
+        # 3 fresh evals/step — ~1.33x at the production Courant factor (CFL=0.1, far below
+        # the stability limit so cost is stage-count-limited). One RK4 startup step fills
+        # the 1 prior-RHS buffer; the BSSN RHS is time-dependent (SSL ramp) so each MSRK
+        # stage is evaluated at its own node time. See `bssn-codegen` memory `msrk-bssn-spectrum`.
+        self.integrator = integrator
+        self._msrk = None
+        if integrator != "rk4":
+            from mcs2d.msrk import METHODS
+            if integrator not in METHODS or METHODS[integrator].n_prev != 1:
+                raise ValueError(f"integrator {integrator!r}: only 'rk4' or a 2-step "
+                                 f"rk4_2_* MSRK method are supported here")
+            self._msrk = METHODS[integrator]
+        # Built once on first evolve() and reused. The WHOLE chunk-loop (fori_loop
+        # -> scan, wrapping the huge CSE step) is jitted as one unit, so a chunked
+        # long run compiles the scan exactly once instead of once per chunk. dt/t0/
+        # nsteps are TRACED args, so a new chunk size or dt does not force a recompile
+        # either (only a new grid shape does).
+        self._jit_evolve = None
+        self._jit_evolve_msrk = None
 
     # --- boundary ---
     def _periodic_sync(self, data):
@@ -58,8 +86,8 @@ class BSSNEvolution:
     def rhs(self, state: BSSNState, t: float = 0.0, dt: float = None) -> BSSNState:
         data = self._periodic_sync(state.data) if self.bc == "periodic" else state.data
         rate = self.solver.rhs(BSSNState(data), t=t, dt=dt).data
-        rate = rate + self._ko(data)
-        return BSSNState(rate)
+        rate = rate + self._ko(data)             # KO is a separate pass for every scheme (fusing it
+        return BSSNState(rate)                   # into the compute-bound cuda_fused kernel lost)
 
     # --- algebraic constraint enforcement ---
     def enforce(self, state: BSSNState) -> BSSNState:
@@ -103,13 +131,64 @@ class BSSNEvolution:
                        state, k1, k2, k3, k4)
         return self.enforce(new)
 
+    # --- one 2-step/3-stage MSRK step (Phase 4.C) ---
+    # carry = (y_n, fprev=f(y_{n-1})). Reuses fprev as stage 0 (node -1, i.e. at t-dt, already
+    # computed last step), then 3 fresh RHS evals. Nodes c2,c3 = a-row sums (consistency
+    # condition) → each fresh stage is evaluated at its own SSL-ramp time. Returns (enforce(y_{n+1}),
+    # k1=f(y_n)) so k1 becomes the next step's fprev. KO/BC/enforce are identical to the RK4 path.
+    def _msrk2_step(self, state, fprev, t, dt):
+        m = self._msrk
+        c2 = m.a20 + m.a21
+        c3 = m.a30 + m.a31 + m.a32
+        k0 = fprev
+        k1 = self.rhs(state, t, dt)
+        Y2 = tree_map(lambda s, a, b: s + dt * (m.a20 * a + m.a21 * b), state, k0, k1)
+        k2 = self.rhs(Y2, t + c2 * dt, dt)
+        Y3 = tree_map(lambda s, a, b, c: s + dt * (m.a30 * a + m.a31 * b + m.a32 * c),
+                      state, k0, k1, k2)
+        k3 = self.rhs(Y3, t + c3 * dt, dt)
+        new = tree_map(lambda s, a, b, c, e: s + dt * (m.b[0] * a + m.b[1] * b
+                                                       + m.b[2] * c + m.b[3] * e),
+                       state, k0, k1, k2, k3)
+        return self.enforce(new), k1
+
     def evolve(self, state: BSSNState, dt: float, nsteps: int,
                t0: float = 0.0) -> BSSNState:
-        step = jax.jit(lambda s, t: self.step(s, t, dt))
+        # dt and t are passed as TRACED, strongly-typed f64 scalars (not Python
+        # floats baked into the graph) so the compiled step has one fixed signature
+        # across every chunk and every dt -> compiles exactly once. The jitted step
+        # is cached on the instance so a fresh lambda isn't created (and re-traced)
+        # per call. (dx is still baked via the stencils, so a new resolution still
+        # recompiles once -- but a long run no longer recompiles mid-flight.)
+        dt = jnp.asarray(dt, dtype=jnp.float64)
+        t0 = jnp.asarray(t0, dtype=jnp.float64)
+        nsteps = jnp.asarray(nsteps, dtype=jnp.int64)
 
-        def body(i, carry):
-            s, t = carry
-            return step(s, t), t + dt
+        if self.integrator != "rk4":
+            # 1 RK4 startup step fills the prior-RHS buffer, then the MSRK recurrence.
+            # NOTE: a chunked long run restarts MSRK (1 RK4 step) per evolve() call; for
+            # tiny chunks thread fprev across calls. Per-call startup is exact (4th order).
+            if self._jit_evolve_msrk is None:
+                @jax.jit
+                def _evolve_msrk(state, dt, nsteps, t0):
+                    f0 = self.rhs(state, t0, dt)              # f(y_0) -> first fprev
+                    y1 = self.step(state, t0, dt)            # RK4 startup step
+                    def body(i, carry):
+                        s, fp, t = carry
+                        snew, fnew = self._msrk2_step(s, fp, t, dt)
+                        return (snew, fnew, t + dt)
+                    s, _, _ = jax.lax.fori_loop(1, nsteps, body, (y1, f0, t0 + dt))
+                    return s
+                self._jit_evolve_msrk = _evolve_msrk
+            return self._jit_evolve_msrk(state, dt, nsteps, t0)
 
-        s, _ = jax.lax.fori_loop(0, nsteps, body, (state, t0))
-        return s
+        if self._jit_evolve is None:
+            @jax.jit
+            def _evolve(state, dt, nsteps, t0):
+                def body(i, carry):
+                    s, t = carry
+                    return self.step(s, t, dt), t + dt
+                s, _ = jax.lax.fori_loop(0, nsteps, body, (state, t0))
+                return s
+            self._jit_evolve = _evolve
+        return self._jit_evolve(state, dt, nsteps, t0)

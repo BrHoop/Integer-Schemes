@@ -81,6 +81,42 @@ _SQRT_RE = re.compile(r"\bsqrt\(")
 _EXP_RE = re.compile(r"\bexp\(")
 _IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 
+# pow(<identifier>, <integer>) — the only pow shape Dendro's CSE emits (exponents {2,-2,-3}
+# on bare temps/fields). Anything else trips the guard in `lower_pow`.
+_POW_RE = re.compile(r"\bpow\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(-?\d+)\s*\)")
+_POW_ANY_RE = re.compile(r"\bpow\(")
+
+
+def lower_pow(expr: str) -> str:
+    """Rewrite ``pow(x, n)`` (integer n) into explicit multiplies / reciprocals.
+
+    Step 3.4 item-2 free win. In CUDA C++ ``pow(double, double)`` is a libcall computed as
+    ``exp(n*log(x))`` — ~20-50x a multiply *and* less accurate than ``x*x``; lowering is both
+    faster and more accurate. Dendro's CSE only emits the simple form
+    ``pow(<identifier>, {2,-2,-3})``; this raises if it ever sees a ``pow`` it cannot lower
+    (a nested-arg or fractional exponent) so we never silently emit a slow libcall.
+
+        pow(x,  n>0) -> (x*x*...*x)         [n factors]
+        pow(x,  n<0) -> (1.0/(x*x*...*x))   [|n| factors]
+
+    n==0 would be a constant 1.0 (not expected from Dendro; handled for completeness).
+    """
+    def _repl(m: re.Match) -> str:
+        base, n = m.group(1), int(m.group(2))
+        if n == 0:
+            return "1.0"
+        factors = "*".join([base] * abs(n))
+        body = factors if abs(n) == 1 else f"({factors})"
+        return body if n > 0 else f"(1.0/{body})"
+
+    out = _POW_RE.sub(_repl, expr)
+    if _POW_ANY_RE.search(out):
+        raise AssertionError(
+            f"lower_pow: unlowerable pow() left in expression (non-identifier base or "
+            f"fractional/non-integer exponent): {out!r}"
+        )
+    return out
+
 
 def _strip_comments(text: str) -> str:
     return "\n".join(line.split("//", 1)[0] for line in text.splitlines())

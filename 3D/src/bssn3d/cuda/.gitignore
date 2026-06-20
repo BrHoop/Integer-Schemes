@@ -1,0 +1,15 @@
+# generated locally / on Marylou — do not commit
+test_vectors.bin
+ricci_vectors.bin
+algebra_vectors.bin
+_bssn_algebra_kernel.cuh
+_deriv_kernel.cuh
+microbench_christoffel
+microbench_ricci
+microbench_algebra
+microbench_algebra_r*
+ffi_add.so
+*.so
+*.o
+__pycache__/
+_bssn_fused_kernel.cuh

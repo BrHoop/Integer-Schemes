@@ -1,6 +1,22 @@
-# Maxwell-Chern-Simons Numerical Solver
+# Integer-Schemes — a GPU-optimized BSSN numerical-relativity pipeline
 
-JAX-based solver for the 2.5D and 3D Maxwell-Chern-Simons (MCS) PDE system, with multiple numerical schemes targeting NVIDIA GPUs (B200 / H100). Designed as a stepping stone to a BSSN binary-black-hole code, so the architecture prioritizes block-structured AMR and shape-stable JIT.
+JAX/CUDA-based numerical-relativity code targeting NVIDIA GPUs (H100/H200), built from a
+Maxwell-Chern-Simons (MCS) toy model up to a **3D BSSN binary-black-hole RHS** at extreme
+mass ratios (senior thesis, advisor Dr. David Neilsen, BYU). The thesis question is *"can
+we make the BSSN GR RHS as fast as possible on the GPU?"* — the headline result is the
+**M4 fused CUDA RHS, 2.28× faster than the XLA-verbatim baseline** (2.07× on the full RK4
+step), with the time integrator (MSRK) adding 1.31× on top.
+
+- **2D/3D MCS** (`mcs2d`, `mcs3d`) — the correctness / Ozaki-bit-reproducibility ground +
+  block-structured AMR.
+- **3D BSSN** (`bssn3d`) — the efficiency ground: a Dendro-GR-validated RHS, fused into one
+  register-resident CUDA kernel.
+- **Multipatch** (`multipatch`) — Llama 7-patch grid + a node-centered 3D block-AMR port.
+
+> **What's the contribution / how is this different from other BSSN-on-GPU solvers?** See
+> [`docs/FUTURE_WORK.md`](docs/FUTURE_WORK.md), the survey
+> [`docs/LITERATURE_SURVEY.md`](docs/LITERATURE_SURVEY.md) §5, and the **"What's novel"**
+> section near the bottom of this file.
 
 ## Repository layout
 
@@ -22,10 +38,12 @@ Integer-Schemes/
 │   │   ├── schemes/          # floating_point, ozaki, pallas_ozaki, fused_*
 │   │   └── amr/              # state, kernels, evolve  (Phase 1 complete)
 │   └── tests/                # unit / integration / regression
-├── 3D/                       # mcs3d — 3D solver (AMR planned, Phase 4)
+├── 3D/                       # 3D solvers
 │   ├── params.toml
-│   ├── src/mcs3d/
-│   └── tests/
+│   ├── src/mcs3d/            # 3D MCS solver (floating-point + unfused ozaki)
+│   ├── src/bssn3d/          # 3D BSSN RHS: verbatim → M4 fused CUDA (cuda/), MSRK, validation
+│   ├── src/multipatch/      # Llama 7-patch grid + node-centered 3D block-AMR (amr/)
+│   └── tests/                # unit / integration / validation / multipatch_amr
 └── pyproject.toml            # workspace root: shared pytest config
 ```
 
@@ -95,9 +113,32 @@ The 3D suite mirrors the same layout under `3D/tests/`.
 | `fused_ozaki`          | Ozaki + fused Pallas/Triton kernel; CRT spills to L2. | Max throughput, B200/H100 |
 | `pallas_ozaki`         | Single Pallas kernel per tile; CRT in shared memory. | No L2 round-trips; fastest Ozaki path |
 
-## AMR (2D, in development)
+## AMR (2D complete; 3D port active)
 
-Phase 1 (static foundation) is complete: block-structured layout, 6th-order prolongation, 2nd-order restriction, ghost-zone sync within and across levels, RK4 stepping at the root level, 2-level static evolution validated against the analytic birefringent wave. See `AMR_PLAN.md` for the multi-phase roadmap.
+The **2D block-structured Berger-Oliger AMR is complete** (static foundation, regridding with
+zero mid-evolution recompile, Hermite sub-cycling, GPU profiling with calibrated caps ~10.5×,
+multi-block within-level sync, moving-feature tracking). A **node-centered 3D block-AMR port**
+onto the Llama multipatch grid is an active CPU parallel track (`3D/src/multipatch/amr/`, Phase A
+done, 25 tests). See `docs/archive/AMR_PLAN.md` for the 2D detail, `docs/FUTURE_WORK.md` §7 for
+open levers, and `docs/phases/README.md` for live project status.
+
+## What's novel (vs other BSSN-on-GPU solvers)
+
+- **A fused single-kernel BSSN RHS (M4).** The 138 finite-difference derivatives are computed
+  into **register scalars** and the whole ~850-statement Christoffel/Ricci/gauge algebra runs in
+  **one CUDA kernel** — derivatives and intermediates never touch HBM. 2.28× over XLA-verbatim,
+  *despite* register spill, because spill is the lesser evil vs the multi-GB HBM derivative
+  round-trip. Dendro-GR/GR-Athena++/AthenaK keep the derivative and algebra in separate passes.
+- **A published-grade register/spill analysis of the full BSSN *evolution* RHS on GPU** — the
+  thing NRPyElliptic/Dendro flag qualitatively and park as "challenging." Includes a **four-way
+  ptxas-invariance result** (source-level CSE/register restructuring spanning 24→2390 temps lands
+  at the same register count) and localization of the irreducible spill to the Ã_ij/Ricci outputs.
+- **The honest negative-plus-positive thesis:** the high-order GR RHS is **latency/spill-bound at
+  ~3% of fp64 peak**, tensor cores are the *wrong* tool for it (non-GEMM pointwise algebra), and
+  the win is locality (fusion) + fewer evals (MSRK), not precision tricks — Ozaki-II relocates to
+  the initial-data elliptic solve where reduced precision is actually safe.
+- **Block-structured + shape-stable-JIT + multipatch (cubed-sphere) grid**, a different GPU
+  tradeoff from Dendro's wavelet octree (regular/coalesced memory vs finer adaptivity).
 
 ## Key parameters
 

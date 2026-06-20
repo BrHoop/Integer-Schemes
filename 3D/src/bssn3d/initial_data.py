@@ -30,6 +30,31 @@ def minkowski(grid: Grid) -> BSSNState:
     return BSSNState.minkowski(grid.shape)
 
 
+def hamiltonian_bump(grid: Grid, amplitude: float = 0.01) -> BSSNState:
+    """Minkowski + a smooth, COHERENT conformal-factor perturbation seeding a clean
+    Hamiltonian-constraint violation (and ~zero momentum violation) for the A6 CAHD
+    damping-rate certificate.
+
+    Unlike ``robust_stability`` (incoherent grid-scale noise, which KO dissipation
+    damps and which carries no coherent H for CAHD to act on -- masking the very
+    effect A6 wants to measure), this perturbs the conformal factor by a single
+    smooth periodic mode::
+
+        chi  ->  chi + A cos(2 pi x) cos(2 pi y) cos(2 pi z)
+
+    on the periodic domain [-1/2, 1/2]^3 (the mode is exactly periodic). The
+    conformal metric, K, and Atilde are left flat, so the momentum constraint stays
+    ~0 while the curved conformal factor sources a coherent Hamiltonian constraint
+    H != 0 -- precisely the structured violation the CAHD term
+    (``chi_rhs += cahd_c (dx^2/dt) chi H``) is designed to damp.
+    """
+    base = BSSNState.minkowski(grid.shape).data
+    twopi = 2.0 * jnp.pi
+    pert = amplitude * jnp.cos(twopi * grid.X) * jnp.cos(twopi * grid.Y) \
+        * jnp.cos(twopi * grid.Z)
+    return BSSNState(base.at[CHI].add(pert))
+
+
 def robust_stability(grid: Grid, amp: float = 1.0e-10, seed: int = 0) -> BSSNState:
     """Minkowski + uniform random noise in ``[-amp, amp]`` on all 24 fields.
 
@@ -110,3 +135,157 @@ def gauge_wave(grid: Grid, amplitude: float = 0.01, wavelength: float = None,
 
     data = data.at[GTILDE0 + axis].set(Gt_wave)
     return BSSNState(data)
+
+
+def gauge_wave_solution(grid: Grid, t: float = 0.0, amplitude: float = 0.01,
+                        wavelength: float = None, axis: int = 0) -> BSSNState:
+    """The EXACT harmonic gauge-wave solution at time ``t`` (Minkowski in disguise).
+
+    Identical construction to :func:`gauge_wave`, but with the traveling phase
+    ``k*(x - t)`` instead of ``k*x`` -- the profile translates along ``axis`` at
+    speed 1.  ``gauge_wave_solution(grid, t=0.0, ...)`` reproduces ``gauge_wave`` to
+    round-off (asserted in the validation suite).
+
+    This is an exact solution of the Einstein equations at every ``t`` (so its
+    continuum Hamiltonian/momentum constraints vanish), under HARMONIC slicing.  It
+    is the analytic reference for the convergence-to-exact guards.
+
+    NOTE (see ``docs/BSSN_VALIDATION_PLAN.md`` A2): the production CAHD+SSL RHS does
+    NOT preserve this solution -- it uses 1+log slicing, plus an SSL term that drives
+    alpha -> 1 and CAHD damping on chi -- so an *evolved* state will diverge from this
+    reference by an O(amplitude) gauge term that does not converge away.  Use this for
+    constraint-of-exact-solution convergence (gauge-independent), NOT for
+    evolve-then-compare-to-exact.
+    """
+    if wavelength is None:
+        coords = (grid.x, grid.y, grid.z)[axis]
+        wavelength = float(coords[-grid.ng - 1] - coords[grid.ng]) + \
+            (grid.dx, grid.dy, grid.dz)[axis]
+
+    coord = (grid.X, grid.Y, grid.Z)[axis]
+    k = 2.0 * jnp.pi / wavelength
+    phase = k * (coord - t)                # the only change vs gauge_wave: travels
+
+    A = amplitude
+    H = 1.0 - A * jnp.sin(phase)
+    dH_dx = -A * k * jnp.cos(phase)
+    dH_dt = -dH_dx
+
+    sqrtH = jnp.sqrt(H)
+    Kxx = -dH_dt / (2.0 * sqrtH)
+    Ktrace = Kxx / H
+
+    chi = H ** (-1.0 / 3.0)
+    gt_wave = H ** (2.0 / 3.0)
+    gt_trans = chi
+
+    At_wave = chi * (Kxx - (1.0 / 3.0) * H * Ktrace)
+    At_trans = chi * (0.0 - (1.0 / 3.0) * 1.0 * Ktrace)
+    Gt_wave = (2.0 / 3.0) * H ** (-5.0 / 3.0) * dH_dx
+
+    gt_diag = (GT0, GT3, GT5)
+    at_diag = (AT0, AT3, AT5)
+
+    data = jnp.zeros((NUM_VARS,) + grid.shape, dtype=jnp.float64)
+    data = data.at[ALPHA].set(sqrtH)
+    data = data.at[CHI].set(chi)
+    data = data.at[K].set(Ktrace)
+    for a in range(3):
+        data = data.at[gt_diag[a]].set(gt_wave if a == axis else gt_trans)
+        data = data.at[at_diag[a]].set(At_wave if a == axis else At_trans)
+    data = data.at[GTILDE0 + axis].set(Gt_wave)
+    return BSSNState(data)
+
+
+def gowdy_solution(grid: Grid, t: float = 1.0) -> BSSNState:
+    """Polarized Gowdy T^3 cosmology -- an exact, CURVED, nonlinear vacuum solution --
+    as BSSN variables at time ``t`` (Babiuc et al. 2008 / New et al. 1998).
+
+    Unlike the gauge waves (flat space in disguise), this is genuinely curved and
+    dynamical, so it exercises the nonlinear RHS the gauge waves leave thin. The
+    inhomogeneous direction is ``z``; ``x``/``y`` are the two polarization directions.
+    Periodic on [-1/2, 1/2]^3 (cos(2 pi z) has period 1).
+
+    4-metric::
+
+        ds^2 = t^{-1/2} e^{L/2}(-dt^2 + dz^2) + t(e^P dx^2 + e^{-P} dy^2)
+        P  = J0(2 pi t) cos(2 pi z)
+        L  = -2 pi t J0 J1 cos^2(2 pi z) + 2 pi^2 t^2 (J0^2 + J1^2) - C
+
+    with ``Jn = Jn(2 pi t)`` the Bessel functions (evaluated on the HOST at the scalar
+    argument 2 pi t; only cos/sin(2 pi z) live on the grid -> no JAX Bessel needed) and
+    ``C`` the t=1 normalization constant.
+
+    ADM (diagonal, zero shift)::
+
+        alpha = t^{-1/4} e^{L/4},   beta^i = 0
+        gamma = diag(t e^P, t e^{-P}, t^{-1/2} e^{L/2})
+        K_ij  = -(1/2 alpha) d_t gamma_ij
+
+    NOTE (same gauge caveat as ``gauge_wave_solution`` / plan A2,B1,B2): the production
+    1+log + Gamma-driver + SSL gauge does NOT preserve this solution. Use it for
+    constraint-of-exact convergence (gauge-independent) and evolution self-convergence,
+    NOT evolve-then-compare-to-exact.
+    """
+    from scipy.special import j0, j1               # host-side scalar Bessel evals
+
+    tw = 2.0 * float(jnp.pi)
+    pi2 = float(jnp.pi) ** 2
+    b0, b1 = float(j0(tw * t)), float(j1(tw * t))
+    c0, c1 = float(j0(tw)), float(j1(tw))           # t=1 normalization constant
+    C = 0.5 * (tw * tw * (c0 * c0 + c1 * c1) - tw * c0 * c1)
+
+    z = grid.Z
+    cz = jnp.cos(tw * z)
+    s2z = jnp.sin(2.0 * tw * z)                      # sin(4 pi z)
+
+    # P, lambda and the derivatives needed for K_ij and Gamma~ (Bessel id: J0'=-J1).
+    P = b0 * cz
+    P_t = -tw * b1 * cz
+    lam = -tw * t * b0 * b1 * cz ** 2 + 2.0 * pi2 * t * t * (b0 * b0 + b1 * b1) - C
+    lam_z = 4.0 * pi2 * t * b0 * b1 * s2z
+    lam_t = 4.0 * pi2 * t * (b0 * b0 - (b0 * b0 - b1 * b1) * cz ** 2)
+
+    # ADM variables
+    eP = jnp.exp(P)
+    g_xx = t * eP
+    g_yy = t / eP
+    g_zz = t ** (-0.5) * jnp.exp(0.5 * lam)
+    alpha = t ** (-0.25) * jnp.exp(0.25 * lam)
+
+    # K_ij = -(1/2 alpha) d_t gamma_ij  (zero shift)
+    dt_gxx = eP * (1.0 + t * P_t)
+    dt_gyy = (1.0 / eP) * (1.0 - t * P_t)
+    dt_gzz = g_zz * (0.5 * lam_t - 0.5 / t)
+    Kxx = -dt_gxx / (2.0 * alpha)
+    Kyy = -dt_gyy / (2.0 * alpha)
+    Kzz = -dt_gzz / (2.0 * alpha)
+    Ktr = Kxx / g_xx + Kyy / g_yy + Kzz / g_zz       # K = gamma^{ij} K_ij
+
+    # BSSN reduction (det gamma = t^{3/2} e^{L/2})
+    chi = (g_xx * g_yy * g_zz) ** (-1.0 / 3.0)
+    At_xx = chi * (Kxx - g_xx * Ktr / 3.0)
+    At_yy = chi * (Kyy - g_yy * Ktr / 3.0)
+    At_zz = chi * (Kzz - g_zz * Ktr / 3.0)
+    # Gamma~^z = -d_z g~^{zz} = (t/3) e^{-L/3} L_z ;  Gamma~^{x,y} = 0 (no x,y dependence)
+    Gt_z = (t / 3.0) * jnp.exp(-lam / 3.0) * lam_z
+
+    data = jnp.zeros((NUM_VARS,) + grid.shape, dtype=jnp.float64)
+    data = data.at[ALPHA].set(alpha)
+    data = data.at[CHI].set(chi)
+    data = data.at[K].set(Ktr)
+    data = data.at[GT0].set(chi * g_xx)
+    data = data.at[GT3].set(chi * g_yy)
+    data = data.at[GT5].set(chi * g_zz)
+    data = data.at[AT0].set(At_xx)
+    data = data.at[AT3].set(At_yy)
+    data = data.at[AT5].set(At_zz)
+    data = data.at[GTILDE0 + 2].set(Gt_z)
+    return BSSNState(data)
+
+
+def gowdy(grid: Grid, t0: float = 1.0) -> BSSNState:
+    """Polarized Gowdy initial data at ``t = t0`` (default 1.0 -- the smooth expanding
+    slice where the metric is O(1) and well resolved). Thin wrapper over
+    :func:`gowdy_solution`."""
+    return gowdy_solution(grid, t=t0)

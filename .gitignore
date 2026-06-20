@@ -218,6 +218,22 @@ traces/
 output/
 # Generic validation-harness output (default now lives under docs/.../step_1.1_results)
 validation_plots/
-# NOTE: docs/phases/phase_1_stencil_core/step_1.1_results/ is intentionally TRACKED
-# (the Step 1.1 deliverables live with the spec). Do not ignore it.# XLA dump from bssn3d.spill_probe (regenerated; large IR/MLIR files)
+# NOTE: docs/phases/phase_*/step_*_results/ are intentionally TRACKED
+# (the step deliverables live with the spec). Do not ignore them.
+
+# XLA dump from bssn3d.spill_probe (regenerated; large IR/MLIR files)
 bssn_xla_dump/
+
+# ── Local-only: kept on disk, NOT tracked / pushed (owner's request 2026-06-19) ──
+# Private thesis docs/working notes — the public repo is code-only.
+docs/
+# Agent config.
+CLAUDE.md
+# All shell scripts: local tooling (sync.sh, run*.sh) AND the cuda build_*.sh.
+# NB: excluding the cuda build scripts means a fresh clone can't compile the M4
+#     kernel as-is. To re-include just those, add: !3D/src/bssn3d/cuda/build_*.sh
+*.sh
+# Local sync/setup config.
+.rsyncignore
+# Throwaway calibration helper (must sit at repo root for the systemd-run scope).
+a6_one.py

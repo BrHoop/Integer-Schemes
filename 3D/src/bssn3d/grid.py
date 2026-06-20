@@ -37,11 +37,14 @@ class Grid:
         return (self.Nx + 2 * self.ng, self.Ny + 2 * self.ng, self.Nz + 2 * self.ng)
 
     @classmethod
-    def from_domain(cls, N, order=6, lo=-0.5, hi=0.5):
-        """Cubic domain ``[lo, hi]^3`` with ``N`` interior cells per axis."""
+    def from_domain(cls, N, order=6, lo=-0.5, hi=0.5, ko_order=8):
+        """Cubic domain ``[lo, hi]^3`` with ``N`` interior cells per axis.
+
+        ``ko_order`` defaults to 8 (production: 6th-order FD + 8th-order KO → ``ng = 4``).
+        """
         if isinstance(N, int):
             N = (N, N, N)
-        ng = SpatialDerivative(order=order).ng
+        ng = SpatialDerivative(order=order, ko_order=ko_order).ng
         d = [(hi - lo) / n for n in N]
         return cls(Nx=N[0], Ny=N[1], Nz=N[2], dx=d[0], dy=d[1], dz=d[2],
                    ng=ng, xmin=lo, ymin=lo, zmin=lo)

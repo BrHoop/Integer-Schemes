@@ -39,8 +39,11 @@ class ConstraintSolver:
     def __init__(self, grid: Grid, order: int = 6):
         self.grid = grid
         self.diff_op = SpatialDerivative(order=order)
-        if self.diff_op.ng != grid.ng:
-            raise ValueError(f"order {order} needs ng={self.diff_op.ng}, grid ng={grid.ng}")
+        # The grid must carry AT LEAST the stencil's ghosts; extra ghosts (e.g. ng=4 from a
+        # production 8th-order-KO grid serving this 6th-order, reach-3 constraint stencil) are
+        # fine — the operator edge-pads to its own reach and leaves the interior unchanged.
+        if self.diff_op.ng > grid.ng:
+            raise ValueError(f"order {order} needs ng>={self.diff_op.ng}, grid ng={grid.ng}")
 
     def constraints(self, state: BSSNState) -> Dict[str, jnp.ndarray]:
         """``{'H','M0','M1','M2'}`` over the full padded grid."""

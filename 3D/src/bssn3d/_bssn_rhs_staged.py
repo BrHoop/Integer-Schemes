@@ -7,7 +7,7 @@ only constrain fusion. Verbatim stays the oracle reference.
 
 Transliterated from Dendro-GR  bssneqs_SSL_HD_dxsq.cpp
   sha256[:16] = 7b5353750d4240dd
-  generated   = 2026-06-12
+  generated   = 2026-06-16
   statements  = 850   grad1 = 72   grad2 = 66
 
 Regenerate:  python -m bssn3d.staging

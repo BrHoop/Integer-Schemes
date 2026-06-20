@@ -48,23 +48,40 @@ class SpatialDerivative:
         8: jnp.array([-1, 8, -28, 56, -70, 56, -28, 8, -1]) / 256.0
     }
 
-    def __init__(self, order: int = 8):
-        """Initializes the derivative operator and maps the required stencils."""
+    def __init__(self, order: int = 8, ko_order: int = None):
+        """Initializes the derivative operator and maps the required stencils.
+
+        ``order`` sets the 1st/2nd FD stencils; ``ko_order`` (default = ``order``) sets the
+        Kreiss-Oliger stencil independently. Production pairs **6th-order FD with 8th-order
+        KO** (the 2N+2 rule: an order-2m FD wants order-2m+2 KO so dissipation error stays
+        below truncation error), so ``SpatialDerivative(order=6, ko_order=8)`` → ``ng = 4``.
+        The ghost width is the WIDEST stencil's reach, ``max(order, ko_order) // 2``.
+        """
         if order not in [4, 6, 8]:
             raise ValueError(
                 f"Unsupported finite difference order. Expected 4, 6, or 8, but got {order}."
             )
+        ko_order = order if ko_order is None else ko_order
+        if ko_order not in [4, 6, 8]:
+            raise ValueError(
+                f"Unsupported KO order. Expected 4, 6, or 8, but got {ko_order}."
+            )
 
         self.order = order
-        self.ng = order // 2
+        self.ko_order = ko_order
+        self.ng = max(order, ko_order) // 2
 
         self.C1 = self.STENCILS_C1[order]
         self.C2 = self.STENCILS_C2[order]
-        self.CKO = self.STENCILS_CKO[order]
+        self.CKO = self.STENCILS_CKO[ko_order]
 
     def _apply(self, grid: jnp.ndarray, coeffs: jnp.ndarray, factor: float, axis: int) -> jnp.ndarray:
         stencil = coeffs * factor
-        pad_width = [(self.ng, self.ng) if i == axis else (0, 0) for i in range(grid.ndim)]
+        # Pad by the stencil's OWN reach, not self.ng: a narrower stencil (e.g. 6th-order
+        # FD, reach 3) must stay centred even when self.ng is set by a WIDER one (8th-order
+        # KO, reach 4). They coincide when every stencil shares the order (4/6/8 matched).
+        reach = (coeffs.shape[0] - 1) // 2
+        pad_width = [(reach, reach) if i == axis else (0, 0) for i in range(grid.ndim)]
         padded = jnp.pad(grid, pad_width, mode='edge')
         n = grid.shape[axis]
         return sum(stencil[k] * lax.slice_in_dim(padded, k, k + n, axis=axis)
